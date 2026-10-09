@@ -4,165 +4,203 @@ import {
   verifyAuthenticationResponse,
   verifyRegistrationResponse,
 } from '@simplewebauthn/server';
-import {
+// NOTE: there is no `@simplewebauthn/types` package at v13 — it was discontinued
+// after v12 and the types now ship inside the server/browser packages. Importing
+// it (as the old code did) is an unsatisfiable dependency and broke the build.
+import type {
   AuthenticationResponseJSON,
   RegistrationResponseJSON,
-} from '@simplewebauthn/types';
+} from '@simplewebauthn/server';
+import { db } from '@/lib/db';
 
-const RP_ID = process.env.RP_ID || (process.env.NODE_ENV === 'production' ? 'kchat.nikniksen.de' : 'localhost');
-const RP_NAME = 'Passk - Encrypted Chat';
-const ORIGIN = process.env.ORIGIN || (process.env.NODE_ENV === 'production' ? 'https://kchat.nikniksen.de' : 'http://localhost:3000');
+const RP_NAME = 'KChat';
 
-// Validate configuration
-if (!RP_ID || !ORIGIN) {
-  console.error('WebAuthn configuration error:', { RP_ID, ORIGIN, NODE_ENV: process.env.NODE_ENV });
-  throw new Error('WebAuthn configuration is incomplete. RP_ID and ORIGIN must be set.');
+function getConfig() {
+  const nodeEnv = process.env.NODE_ENV;
+  const rpID = process.env.RP_ID ?? 'localhost';
+  const origin =
+    process.env.ORIGIN ?? (nodeEnv === 'production' ? '' : 'http://localhost:3000');
+
+  if (!rpID || !origin) {
+    throw new Error(
+      'WebAuthn is misconfigured: set RP_ID and ORIGIN in your environment.',
+    );
+  }
+  return { rpID, origin, rpName: RP_NAME };
 }
 
-console.log('WebAuthn configuration:', { RP_ID, ORIGIN, NODE_ENV: process.env.NODE_ENV });
-
-export interface PasskeyUser {
-  id: string;
-  email: string;
-  name?: string;
-  passkeyCredentialId?: string;
-  passkeyPublicKey?: string;
-  passkeyCounter?: bigint;
-}
+const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
 export class WebAuthnService {
-  // Generate registration options for new passkey
-  generateRegistrationOptions(user: PasskeyUser) {
-    return generateRegistrationOptions({
-      rpName: RP_NAME,
-      rpID: RP_ID,
-      userID: new TextEncoder().encode(user.id),
-      userName: user.email,
-      userDisplayName: user.name || user.email,
-      timeout: 60000,
-      attestationType: 'none',
-      authenticatorSelection: {
-        residentKey: 'preferred',
-        userVerification: 'preferred',
-        authenticatorAttachment: 'platform',
-      },
+  private config() {
+    return getConfig();
+  }
+
+  async purgeExpiredChallenges() {
+    await db.webAuthnChallenge.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
     });
   }
 
-  // Verify registration response
-  async verifyRegistration(
-    response: RegistrationResponseJSON,
-    challenge: string,
-    user: PasskeyUser
-  ): Promise<{
-    verified: boolean;
-    credentialId: string;
-    publicKey: string;
-    counter: number;
-  }> {
-    try {
-      const verification = await verifyRegistrationResponse({
-        response,
-        expectedChallenge: challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
-      });
+  /** Generate + persist a challenge. Returns the options for the browser. */
+  async createRegistrationChallenge(userId: string, username: string) {
+    const { rpID, rpName } = this.config();
+    const user = await db.user.findUniqueOrThrow({ where: { id: userId } });
 
-      if (!verification.verified || !verification.registrationInfo) {
-        throw new Error('Registration verification failed');
-      }
-
-      const { credentialID, credentialPublicKey, counter } = verification.registrationInfo;
-
-      return {
-        verified: true,
-        credentialId: credentialID,
-        publicKey: Buffer.from(credentialPublicKey).toString('base64'),
-        counter,
-      };
-    } catch (error) {
-      console.error('Registration verification error:', error);
-      return {
-        verified: false,
-        credentialId: '',
-        publicKey: '',
-        counter: 0,
-      };
-    }
-  }
-
-  // Generate authentication options for existing passkey
-  generateAuthenticationOptions(user?: PasskeyUser) {
-    const options = generateAuthenticationOptions({
-      rpID: RP_ID,
-      rpName: RP_NAME,
+    const options = await generateRegistrationOptions({
+      rpName,
+      rpID,
+      userID: new TextEncoder().encode(user.id),
+      // Usernames are display labels and may collide, so the unique user.id
+      // (not the username) must be the WebAuthn user handle.
+      userName: `${username}-${user.id.slice(-8)}`,
+      userDisplayName: username,
       timeout: 60000,
-      allowCredentials: user?.passkeyCredentialId
-        ? [
-            {
-              id: user.passkeyCredentialId,
-              type: 'public-key',
-              transports: ['internal', 'ble', 'nfc'],
-            },
-          ]
+      attestationType: 'none',
+      excludeCredentials: user.passkeyCredentialId
+        ? [{ id: user.passkeyCredentialId }]
         : [],
-      userVerification: 'preferred',
+      authenticatorSelection: {
+        residentKey: 'required',
+        // "required" so passkeys are bound to the device — this is what makes
+        // usernameless login possible later.
+        userVerification: 'required',
+      },
+    });
+
+    await db.webAuthnChallenge.create({
+      data: {
+        challenge: options.challenge,
+        type: 'registration',
+        userId,
+        expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS),
+      },
     });
 
     return options;
   }
 
-  // Verify authentication response
+  async createAuthenticationChallenge() {
+    const { rpID } = this.config();
+
+    // allowCredentials stays EMPTY on purpose. This is a "discoverable
+    // credential" login: the browser shows its own native passkey picker and
+    // the response tells us which credential was used. That's what lets login
+    // work with no username at all.
+    const options = await generateAuthenticationOptions({
+      rpID,
+      timeout: 60000,
+      allowCredentials: [],
+      userVerification: 'required',
+    });
+
+    await db.webAuthnChallenge.create({
+      data: {
+        challenge: options.challenge,
+        type: 'authentication',
+        userId: null,
+        expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS),
+      },
+    });
+
+    return options;
+  }
+
+  /**
+   * Verify a registration against a challenge we issued, then delete it.
+   * Single-use: prevents replay of a completed ceremony.
+   */
+  async consumeRegistrationChallenge(challenge: string) {
+    const record = await db.webAuthnChallenge.findUnique({ where: { challenge } });
+    if (!record || record.type !== 'registration') {
+      throw new Error('Unknown or already-used registration challenge');
+    }
+    if (record.expiresAt < new Date()) {
+      await db.webAuthnChallenge.delete({ where: { id: record.id } }).catch(() => {});
+      throw new Error('Registration challenge expired — please try again');
+    }
+    await db.webAuthnChallenge.delete({ where: { id: record.id } });
+    return record.userId!;
+  }
+
+  async consumeAuthenticationChallenge(challenge: string) {
+    const record = await db.webAuthnChallenge.findUnique({ where: { challenge } });
+    if (!record || record.type !== 'authentication') {
+      throw new Error('Unknown or already-used authentication challenge');
+    }
+    if (record.expiresAt < new Date()) {
+      await db.webAuthnChallenge.delete({ where: { id: record.id } }).catch(() => {});
+      throw new Error('Authentication challenge expired — please try again');
+    }
+    await db.webAuthnChallenge.delete({ where: { id: record.id } });
+    return record;
+  }
+
+  async verifyRegistration(
+    response: RegistrationResponseJSON,
+    challenge: string,
+  ) {
+    const { rpID, origin } = this.config();
+
+    const verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge: challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      requireUserVerification: true,
+    });
+
+    if (!verification.verified || !verification.registrationInfo) {
+      throw new Error('Passkey registration could not be verified');
+    }
+
+    const { registrationInfo } = verification;
+    const { id, publicKey, counter } = registrationInfo.credential;
+
+    return {
+      credentialId: id,
+      publicKey: Buffer.from(publicKey).toString('base64'),
+      counter,
+    };
+  }
+
   async verifyAuthentication(
     response: AuthenticationResponseJSON,
     challenge: string,
-    user: PasskeyUser
-  ): Promise<{
-    verified: boolean;
-    counter: number;
-  }> {
-    if (!user.passkeyCredentialId || !user.passkeyPublicKey) {
-      throw new Error('User has no passkey registered');
+  ) {
+    const { rpID, origin } = this.config();
+
+    // Identity comes from the credential in the assertion, not from anything
+    // the client claims. This is the core of the passkey-only model.
+    const user = await db.user.findUnique({
+      where: { passkeyCredentialId: response.id },
+    });
+
+    // Check passkeyCredentialId specifically: checking only the public key
+    // leaves TS unable to prove the id is non-null, since the two are
+    // independently nullable columns.
+    if (!user?.passkeyCredentialId || !user.passkeyPublicKey) {
+      throw new Error('This passkey is not registered');
     }
 
-    try {
-      const verification = await verifyAuthenticationResponse({
-        response,
-        expectedChallenge: challenge,
-        expectedOrigin: ORIGIN,
-        expectedRPID: RP_ID,
-        authenticator: {
-          credentialID: user.passkeyCredentialId,
-          credentialPublicKey: Buffer.from(user.passkeyPublicKey, 'base64'),
-          counter: user.passkeyCounter || 0,
-        },
-      });
+    const verification = await verifyAuthenticationResponse({
+      response,
+      expectedChallenge: challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      requireUserVerification: true,
+      credential: {
+        id: user.passkeyCredentialId,
+        publicKey: new Uint8Array(Buffer.from(user.passkeyPublicKey, 'base64')),
+        counter: Number(user.passkeyCounter ?? 0),
+      },
+    });
 
-      if (!verification.verified) {
-        throw new Error('Authentication verification failed');
-      }
-
-      return {
-        verified: true,
-        counter: verification.authenticationInfo.newCounter,
-      };
-    } catch (error) {
-      console.error('Authentication verification error:', error);
-      return {
-        verified: false,
-        counter: 0,
-      };
+    if (!verification.verified) {
+      throw new Error('Passkey authentication could not be verified');
     }
-  }
 
-  // Convert credential ID to base64 for storage
-  credentialIdToBase64(credentialId: Uint8Array): string {
-    return Buffer.from(credentialId).toString('base64');
-  }
-
-  // Convert base64 to credential ID
-  base64ToCredentialId(base64: string): Uint8Array {
-    return new Uint8Array(Buffer.from(base64, 'base64'));
+    return { user, counter: verification.authenticationInfo.newCounter };
   }
 }
 

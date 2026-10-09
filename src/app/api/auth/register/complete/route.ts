@@ -1,63 +1,77 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { webAuthnService } from '@/lib/webauthn';
+import {
+  createSessionToken,
+  displayNameOf,
+  SESSION_COOKIE,
+  sessionCookieOptions,
+} from '@/lib/auth';
 
-export async function PUT(request: NextRequest) {
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+/**
+ * Finish registration and log the user in immediately.
+ *
+ * The challenge is looked up in the database rather than trusted from the
+ * request body. The previous implementation had the client POST back the
+ * challenge it had already been issued, so the value being verified was chosen
+ * by the party being verified.
+ */
+export async function POST(request: NextRequest) {
+  let pendingUserId: string | null = null;
+
   try {
-    const { credential, challenge, userId } = await request.json();
+    const { credential, challenge } = await request.json();
 
-    if (!credential || !challenge || !userId) {
+    if (!credential || !challenge) {
       return NextResponse.json(
         { error: 'Missing required fields' },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
-    // Get user from database
-    const user = await db.user.findUnique({
-      where: { id: userId },
-    });
+    const userId = await webAuthnService.consumeRegistrationChallenge(challenge);
+    pendingUserId = userId;
 
-    if (!user) {
-      return NextResponse.json(
-        { error: 'User not found' },
-        { status: 404 }
-      );
-    }
+    const { credentialId, publicKey, counter } =
+      await webAuthnService.verifyRegistration(credential, challenge);
 
-    // Verify registration
-    const verification = await webAuthnService.verifyRegistration(
-      credential,
-      challenge,
-      user
-    );
-
-    if (!verification.verified) {
-      return NextResponse.json(
-        { error: 'Passkey registration failed' },
-        { status: 400 }
-      );
-    }
-
-    // Update user with passkey credentials
-    await db.user.update({
+    const user = await db.user.update({
       where: { id: userId },
       data: {
-        passkeyCredentialId: verification.credentialId,
-        passkeyPublicKey: verification.publicKey,
-        passkeyCounter: BigInt(verification.counter),
+        passkeyCredentialId: credentialId,
+        passkeyPublicKey: publicKey,
+        passkeyCounter: BigInt(counter),
       },
+      select: { id: true, username: true, e2ePublicKey: true },
     });
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       success: true,
-      message: 'Registration completed successfully',
+      user: {
+        id: user.id,
+        username: user.username,
+        displayName: displayNameOf(user.username),
+      },
     });
-  } catch (error) {
-    console.error('Registration completion error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
+    response.cookies.set(
+      SESSION_COOKIE,
+      createSessionToken({ id: user.id, username: user.username }),
+      sessionCookieOptions(),
     );
+    return response;
+  } catch (error) {
+    // Don't strand a half-registered account if the passkey step failed.
+    if (pendingUserId) {
+      await db.user
+        .delete({ where: { id: pendingUserId } })
+        .catch(() => {});
+    }
+
+    const message =
+      error instanceof Error ? error.message : 'Registration failed';
+    return NextResponse.json({ error: message }, { status: 400 });
   }
 }

@@ -1,471 +1,442 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Separator } from '@/components/ui/separator';
-import { Badge } from '@/components/ui/badge';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
-import { Send, Users, Search, MessageSquare, LogOut, Moon, Sun } from 'lucide-react';
+import {
+  Send,
+  Search,
+  MessageSquare,
+  LogOut,
+  Moon,
+  Sun,
+  Lock,
+} from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
 import { useRouter } from 'next/navigation';
 import { useTheme } from 'next-themes';
-import { LoadingPage, LoadingCard } from '@/components/Loading';
+import { LoadingPage } from '@/components/Loading';
 import ErrorBoundary from '@/components/ErrorBoundary';
+import { decryptFrom, encryptFor, getOrCreateLocalKeyPair } from '@/lib/crypto';
 
-interface User {
+interface Peer {
   id: string;
-  email: string;
-  name?: string;
+  username: string | null;
+  displayName: string;
+  publicKey: string | null;
 }
 
-interface ChatSession {
+interface Session {
   id: string;
-  participant1: User;
-  participant2: User;
-  lastMessage?: {
-    id: string;
-    encryptedContent: string;
-    timestamp: string;
-    senderId: string;
-  };
+  peer: Peer;
+  lastMessageAt: string | null;
 }
 
-interface Message {
+interface Me {
+  id: string;
+  username: string | null;
+  displayName: string;
+  e2ePublicKey: string | null;
+}
+
+interface MessageRow {
   id: string;
   senderId: string;
-  sender: User;
-  encryptedContent: string;
+  ciphertext: string;
   timestamp: string;
 }
 
-interface DoubleRatchetState {
-  rootKey: string;
-  senderChainKey: string;
-  receiverChainKey: string;
-  senderRatchetKey: { publicKey: string; privateKey: string };
-  receiverRatchetKey: { publicKey: string; privateKey: string };
-  messageNumber: number;
+interface DecryptedMessage {
+  id: string;
+  senderId: string;
+  text: string;
+  timestamp: string;
 }
 
 export default function ChatPage() {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [selectedSession, setSelectedSession] = useState<ChatSession | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [messageInput, setMessageInput] = useState('');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<User[]>([]);
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [ratchetStates, setRatchetStates] = useState<Map<string, DoubleRatchetState>>(new Map());
-  const [isTyping, setIsTyping] = useState<Map<string, boolean>>(new Map());
-  const [isLoading, setIsLoading] = useState(true);
+  const [me, setMe] = useState<Me | null>(null);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [active, setActive] = useState<Session | null>(null);
+  const [messages, setMessages] = useState<DecryptedMessage[]>([]);
+  const [draft, setDraft] = useState('');
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<Peer[]>([]);
+  const [peerTyping, setPeerTyping] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const router = useRouter();
   const { theme, setTheme } = useTheme();
+  const socketRef = useRef<Socket | null>(null);
+  const privateKeyRef = useRef<Uint8Array | null>(null);
+  // Mirrors `active` so socket handlers — which are registered once and must
+  // not resubscribe on every selection — can read the current value.
+  const activeRef = useRef<Session | null>(null);
 
   useEffect(() => {
-    // Check authentication
-    const checkAuth = async () => {
+    (async () => {
       try {
-        const response = await fetch('/api/auth/me');
-        if (!response.ok) {
-          router.push('/');
+        const res = await fetch('/api/auth/me');
+        if (!res.ok) {
+          router.replace('/');
           return;
         }
-        const user = await response.json();
-        setCurrentUser(user);
-      } catch (error) {
-        router.push('/');
+        const user: Me = await res.json();
+        privateKeyRef.current = getOrCreateLocalKeyPair().privateKey;
+        setMe(user);
+      } catch {
+        router.replace('/');
+      } finally {
+        setLoading(false);
       }
-    };
-
-    checkAuth();
+    })();
   }, [router]);
 
+  const loadSessions = useCallback(async () => {
+    try {
+      const res = await fetch('/api/chat/session');
+      if (res.ok) {
+        const data = await res.json();
+        setSessions(data.sessions ?? []);
+      }
+    } catch {
+      /* transient */
+    }
+  }, []);
+
+  /** Select a conversation, join its room, and decrypt its history. */
+  const openSessionWith = useCallback(async (session: Session) => {
+    activeRef.current = session;
+    setActive(session);
+    setError(null);
+    socketRef.current?.emit('join-chat', session.id);
+
+    const priv = privateKeyRef.current;
+    const peerPub = session.peer.publicKey;
+    if (!priv || !peerPub) {
+      setError(
+        "This conversation can't be decrypted: the other person's public key is missing.",
+      );
+      setMessages([]);
+      return;
+    }
+
+    const res = await fetch(`/api/chat/messages?chatSessionId=${session.id}`);
+    if (!res.ok) {
+      setError('Could not load messages.');
+      return;
+    }
+    const { messages: rows } = await res.json();
+
+    setMessages(
+      (rows as MessageRow[]).map((row) => {
+        try {
+          return {
+            id: row.id,
+            senderId: row.senderId,
+            text: decryptFrom(row.ciphertext, priv, base64ToBytes(peerPub)),
+            timestamp: row.timestamp,
+          };
+        } catch {
+          return {
+            id: row.id,
+            senderId: row.senderId,
+            text: '⚠️ Could not decrypt this message',
+            timestamp: row.timestamp,
+          };
+        }
+      }),
+    );
+  }, []);
+
   useEffect(() => {
-    if (currentUser) {
-      // Initialize socket connection
-      const newSocket = io('/api/socket/io', {
-        auth: {
-          token: document.cookie.split('session-token=')[1]?.split(';')[0],
-        },
-      });
+    if (!me) return;
+    loadSessions();
 
-      newSocket.on('connect', () => {
-        console.log('Connected to socket server');
-      });
+    // No token is passed: the session cookie is httpOnly, so the server reads
+    // it from the handshake headers. The previous client tried to read it via
+    // document.cookie, which always returned undefined and broke auth.
+    const socket = io({ path: '/api/socket/io' });
+    socketRef.current = socket;
 
-      newSocket.on('message-received', (data) => {
-        if (selectedSession && data.chatSessionId === selectedSession.id) {
-          setMessages(prev => [...prev, {
-            id: data.messageId,
-            senderId: data.senderId,
-            sender: { id: data.senderId, name: data.senderName, email: '' },
-            encryptedContent: data.content,
-            timestamp: data.timestamp,
-          }]);
-        }
-      });
+    socket.on('message-received', ({ chatSessionId }: { chatSessionId: string }) => {
+      const current = activeRef.current;
+      if (current?.id === chatSessionId) void openSessionWith(current);
+      else void loadSessions();
+    });
 
-      newSocket.on('user-typing', (data) => {
-        setIsTyping(prev => new Map(prev).set(data.userId, data.isTyping));
-      });
+    socket.on('user-typing', ({ userId, isTyping }: { userId: string; isTyping: boolean }) => {
+      const current = activeRef.current;
+      if (current && userId === current.peer.id) setPeerTyping(isTyping);
+    });
 
-      setSocket(newSocket);
+    return () => {
+      socket.close();
+      socketRef.current = null;
+    };
+  }, [me, loadSessions, openSessionWith]);
 
-      // Load chat sessions
-      loadSessions();
-
-      return () => {
-        newSocket.close();
-      };
-    }
-  }, [currentUser]);
-
-  const loadSessions = async () => {
-    try {
-      const response = await fetch('/api/chat/session');
-      if (response.ok) {
-        const data = await response.json();
-        setSessions(data.sessions);
-      }
-    } catch (error) {
-      console.error('Failed to load sessions:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const searchUsers = async (query: string) => {
-    if (!query.trim()) {
-      setSearchResults([]);
+  useEffect(() => {
+    if (query.trim().length === 0) {
+      setResults([]);
       return;
     }
-
-    try {
-      const response = await fetch(`/api/users?q=${encodeURIComponent(query)}`);
-      if (response.ok) {
-        const data = await response.json();
-        setSearchResults(data.users);
+    const t = setTimeout(async () => {
+      const res = await fetch(`/api/users?q=${encodeURIComponent(query)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setResults(data.users ?? []);
       }
-    } catch (error) {
-      console.error('Failed to search users:', error);
-    }
-  };
+    }, 200);
+    return () => clearTimeout(t);
+  }, [query]);
 
-  const startChat = async (otherUser: User) => {
-    try {
-      const response = await fetch('/api/chat/session', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ participantEmail: otherUser.email }),
-      });
+  async function startChat(peer: Peer) {
+    const res = await fetch('/api/chat/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ participantId: peer.id }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    setQuery('');
+    setResults([]);
+    await loadSessions();
+    await openSessionWith(data.session);
+  }
 
-      if (response.ok) {
-        const data = await response.json();
-        if (!data.isExisting) {
-          // Store ratchet state for new session
-          setRatchetStates(prev => new Map(prev).set(data.session.id, data.ratchetState));
-        }
-        
-        setSelectedSession(data.session);
-        setSearchResults([]);
-        setSearchQuery('');
-        loadSessions();
-        loadMessages(data.session.id);
-        
-        if (socket) {
-          socket.emit('join-chat', data.session.id);
-        }
-      }
-    } catch (error) {
-      console.error('Failed to start chat:', error);
-    }
-  };
+  async function send() {
+    const text = draft.trim();
+    if (!text || !active || !me) return;
 
-  const loadMessages = async (sessionId: string) => {
-    try {
-      const response = await fetch(`/api/chat/messages?chatSessionId=${sessionId}`);
-      if (response.ok) {
-        const data = await response.json();
-        setMessages(data.messages);
-      }
-    } catch (error) {
-      console.error('Failed to load messages:', error);
-    }
-  };
+    const priv = privateKeyRef.current;
+    if (!priv || !active.peer.publicKey) return;
 
-  const sendMessage = async () => {
-    if (!messageInput.trim() || !selectedSession || !currentUser) return;
+    setDraft('');
+    const ciphertext = encryptFor(text, priv, base64ToBytes(active.peer.publicKey));
 
-    const ratchetState = ratchetStates.get(selectedSession.id);
-    if (!ratchetState) {
-      console.error('No ratchet state found for session');
+    const res = await fetch('/api/chat/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatSessionId: active.id, ciphertext }),
+    });
+    if (!res.ok) {
+      setError('Message failed to send.');
+      setDraft(text);
       return;
     }
-
-    try {
-      const response = await fetch('/api/chat/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          chatSessionId: selectedSession.id,
-          content: messageInput,
-          ratchetState,
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        
-        // Update ratchet state
-        setRatchetStates(prev => new Map(prev).set(selectedSession.id, data.newRatchetState));
-        
-        // Add message to local state
-        setMessages(prev => [...prev, data.message]);
-        
-        // Emit socket event
-        if (socket) {
-          socket.emit('new-message', {
-            chatSessionId: selectedSession.id,
-            messageId: data.message.id,
-            content: messageInput,
-            receiverId: selectedSession.participant1.id === currentUser.id 
-              ? selectedSession.participant2.id 
-              : selectedSession.participant1.id,
-          });
-        }
-        
-        setMessageInput('');
-      }
-    } catch (error) {
-      console.error('Failed to send message:', error);
-    }
-  };
-
-  const handleTyping = (isTyping: boolean) => {
-    if (socket && selectedSession) {
-      socket.emit('typing', {
-        chatSessionId: selectedSession.id,
-        isTyping,
-      });
-    }
-  };
-
-  const getOtherUser = (session: ChatSession) => {
-    if (!currentUser) return session.participant1;
-    return session.participant1.id === currentUser.id ? session.participant2 : session.participant1;
-  };
-
-  const formatTime = (timestamp: string) => {
-    return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
-
-  if (!currentUser) {
-    return <LoadingPage text="Authenticating..." />;
+    const { message } = await res.json();
+    setMessages((prev) => [
+      ...prev,
+      { id: message.id, senderId: me.id, text, timestamp: message.timestamp },
+    ]);
+    socketRef.current?.emit('message-sent', {
+      chatSessionId: active.id,
+      messageId: message.id,
+      receiverId: active.peer.id,
+    });
+    void loadSessions();
   }
 
-  if (isLoading) {
-    return <LoadingPage text="Loading chats..." />;
-  }
+  if (loading || !me) return <LoadingPage text="Opening your chats…" />;
 
   return (
     <ErrorBoundary>
       <div className="flex h-screen bg-background">
-      {/* Sidebar */}
-      <div className="w-80 border-r flex flex-col">
-        <div className="p-4 border-b">
-          <div className="flex items-center justify-between mb-4">
-            <h1 className="text-xl font-bold">Passk</h1>
-            <div className="flex items-center gap-2">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-              >
-                {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-              </Button>
-              <Button variant="ghost" size="sm" onClick={() => router.push('/')}>
-                <LogOut className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-          
-          {/* Search Users */}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              placeholder="Search users..."
-              value={searchQuery}
-              onChange={(e) => {
-                setSearchQuery(e.target.value);
-                searchUsers(e.target.value);
-              }}
-              className="pl-10"
-            />
-          </div>
-          
-          {/* Search Results */}
-          {searchResults.length > 0 && (
-            <div className="mt-2 space-y-1">
-              {searchResults.map((user) => (
-                <div
-                  key={user.id}
-                  onClick={() => startChat(user)}
-                  className="p-2 hover:bg-accent rounded cursor-pointer flex items-center gap-2"
-                >
-                  <Avatar className="h-8 w-8">
-                    <AvatarFallback>
-                      {user.name?.[0] || user.email[0].toUpperCase()}
-                    </AvatarFallback>
-                  </Avatar>
-                  <div>
-                    <div className="font-medium">{user.name || user.email}</div>
-                    <div className="text-sm text-muted-foreground">{user.email}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Chat Sessions */}
-        <ScrollArea className="flex-1">
-          <div className="p-2">
-            <h2 className="text-sm font-semibold text-muted-foreground mb-2">Recent Chats</h2>
-            {sessions.map((session) => {
-              const otherUser = getOtherUser(session);
-              return (
-                <div
-                  key={session.id}
-                  onClick={() => {
-                    setSelectedSession(session);
-                    loadMessages(session.id);
-                    if (socket) {
-                      socket.emit('join-chat', session.id);
-                    }
-                  }}
-                  className={`p-3 rounded-lg cursor-pointer transition-colors ${
-                    selectedSession?.id === session.id ? 'bg-accent' : 'hover:bg-accent/50'
-                  }`}
-                >
-                  <div className="flex items-center gap-3">
-                    <Avatar className="h-10 w-10">
-                      <AvatarFallback>
-                        {otherUser.name?.[0] || otherUser.email[0].toUpperCase()}
-                      </AvatarFallback>
-                    </Avatar>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between">
-                        <div className="font-medium truncate">
-                          {otherUser.name || otherUser.email}
-                        </div>
-                        {session.lastMessage && (
-                          <div className="text-xs text-muted-foreground">
-                            {formatTime(session.lastMessage.timestamp)}
-                          </div>
-                        )}
-                      </div>
-                      {session.lastMessage && (
-                        <div className="text-sm text-muted-foreground truncate">
-                          {session.lastMessage.encryptedContent}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </ScrollArea>
-      </div>
-
-      {/* Chat Area */}
-      {selectedSession ? (
-        <div className="flex-1 flex flex-col">
+        <div className="w-80 border-r flex flex-col">
           <div className="p-4 border-b">
-            <div className="flex items-center gap-3">
-              <Avatar className="h-10 w-10">
-                <AvatarFallback>
-                  {getOtherUser(selectedSession).name?.[0] || getOtherUser(selectedSession).email[0].toUpperCase()}
-                </AvatarFallback>
-              </Avatar>
+            <div className="flex items-center justify-between mb-4">
               <div>
-                <div className="font-medium">
-                  {getOtherUser(selectedSession).name || getOtherUser(selectedSession).email}
-                </div>
-                <div className="text-sm text-muted-foreground">
-                  {Array.from(isTyping.entries())
-                    .filter(([_, typing]) => typing)
-                    .map(([userId]) => userId === getOtherUser(selectedSession).id ? 'Typing...' : '')
-                    .join(', ') || 'Online'}
-                </div>
+                <h1 className="text-xl font-bold">KChat</h1>
+                <p className="text-xs text-muted-foreground">{me.displayName}</p>
+              </div>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+                >
+                  {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => router.replace('/')}
+                >
+                  <LogOut className="h-4 w-4" />
+                </Button>
               </div>
             </div>
+
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <Input
+                placeholder="Find someone…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="pl-10"
+              />
+            </div>
+
+            {results.length > 0 && (
+              <div className="mt-2 space-y-1 max-h-48 overflow-y-auto">
+                {results.map((user) => (
+                  <button
+                    key={user.id}
+                    onClick={() => startChat(user)}
+                    className="w-full text-left p-2 hover:bg-accent rounded flex items-center gap-2"
+                  >
+                    <Avatar className="h-8 w-8">
+                      <AvatarFallback>{user.displayName[0]?.toUpperCase()}</AvatarFallback>
+                    </Avatar>
+                    <span className="text-sm font-medium truncate">
+                      {user.displayName}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          <ScrollArea className="flex-1 p-4">
-            <div className="space-y-4">
-              {messages.map((message) => (
-                <div
-                  key={message.id}
-                  className={`flex ${message.senderId === currentUser.id ? 'justify-end' : 'justify-start'}`}
+          <ScrollArea className="flex-1">
+            <div className="p-2">
+              <h2 className="text-xs font-semibold text-muted-foreground mb-2 px-2">
+                Conversations
+              </h2>
+              {sessions.length === 0 && (
+                <p className="p-3 text-sm text-muted-foreground">
+                  No conversations yet. Search for someone above to start one.
+                </p>
+              )}
+              {sessions.map((session) => (
+                <button
+                  key={session.id}
+                  onClick={() => void openSessionWith(session)}
+                  className={`w-full text-left p-3 rounded-lg flex items-center gap-3 ${
+                    active?.id === session.id ? 'bg-accent' : 'hover:bg-accent/50'
+                  }`}
                 >
-                  <div
-                    className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
-                      message.senderId === currentUser.id
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-muted'
-                    }`}
-                  >
-                    <div>{message.encryptedContent}</div>
-                    <div className="text-xs opacity-70 mt-1">
-                      {formatTime(message.timestamp)}
+                  <Avatar className="h-9 w-9">
+                    <AvatarFallback>
+                      {session.peer.displayName[0]?.toUpperCase()}
+                    </AvatarFallback>
+                  </Avatar>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium truncate">
+                      {session.peer.displayName}
                     </div>
+                    {session.lastMessageAt && (
+                      <div className="text-xs text-muted-foreground">
+                        {new Date(session.lastMessageAt).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </div>
+                    )}
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </ScrollArea>
+        </div>
 
-          <div className="p-4 border-t">
-            <div className="flex gap-2">
-              <Input
-                placeholder="Type a message..."
-                value={messageInput}
-                onChange={(e) => {
-                  setMessageInput(e.target.value);
-                  handleTyping(e.target.value.length > 0);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
-                  }
-                }}
-              />
-              <Button onClick={sendMessage} disabled={!messageInput.trim()}>
-                <Send className="h-4 w-4" />
-              </Button>
+        {active ? (
+          <div className="flex-1 flex flex-col">
+            <div className="p-4 border-b flex items-center gap-3">
+              <Avatar>
+                <AvatarFallback>
+                  {active.peer.displayName[0]?.toUpperCase()}
+                </AvatarFallback>
+              </Avatar>
+              <div>
+                <div className="font-medium">{active.peer.displayName}</div>
+                <div className="text-xs text-muted-foreground flex items-center gap-1">
+                  {peerTyping ? (
+                    'Typing…'
+                  ) : (
+                    <>
+                      <Lock className="h-3 w-3" />
+                      End-to-end encrypted
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <ScrollArea className="flex-1 p-4">
+              <div className="space-y-3">
+                {messages.map((message) => (
+                  <div
+                    key={message.id}
+                    className={`flex ${message.senderId === me.id ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-md px-4 py-2 rounded-lg text-sm ${
+                        message.senderId === me.id
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-muted'
+                      }`}
+                    >
+                      <div className="break-words">{message.text}</div>
+                      <div className="text-[10px] opacity-70 mt-1">
+                        {new Date(message.timestamp).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </ScrollArea>
+
+            <div className="p-4 border-t">
+              {error && (
+                <p className="mb-2 text-sm text-destructive">{error}</p>
+              )}
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Write a message…"
+                  value={draft}
+                  onChange={(e) => {
+                    setDraft(e.target.value);
+                    socketRef.current?.emit('typing', {
+                      chatSessionId: active.id,
+                      isTyping: e.target.value.length > 0,
+                    });
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      void send();
+                    }
+                  }}
+                />
+                <Button onClick={() => void send()} disabled={!draft.trim()}>
+                  <Send className="h-4 w-4" />
+                </Button>
+              </div>
             </div>
           </div>
-        </div>
-      ) : (
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center text-muted-foreground">
-            <MessageSquare className="h-12 w-12 mx-auto mb-4 opacity-50" />
-            <h3 className="text-lg font-semibold mb-2">Select a chat</h3>
-            <p>Choose a conversation from the sidebar or start a new one</p>
+        ) : (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center text-muted-foreground">
+              <MessageSquare className="h-12 w-12 mx-auto mb-4 opacity-50" />
+              <h3 className="text-lg font-semibold mb-2">Pick a conversation</h3>
+              <p>Search for someone to get started.</p>
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
     </ErrorBoundary>
   );
+}
+
+/** Server public keys are stored as standard base64. */
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }

@@ -1,100 +1,69 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { webAuthnService } from '@/lib/webauthn';
-import { cryptoUtils } from '@/lib/crypto';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+/**
+ * Begin registration.
+ *
+ * Username is optional and NOT unique. The passkey is the identity, so this
+ * endpoint does not need a unique handle and two people may both be called
+ * "Anonymous".
+ *
+ * The user row is created here but left without a passkey. If the user
+ * abandons the browser prompt they simply have no passkey, and re-registering
+ * with the same username is allowed — the old code hard-blocked this with
+ * "User already exists", permanently stranding anyone who dismissed the dialog.
+ */
 export async function POST(request: NextRequest) {
   try {
-    console.log('Registration request received');
-    
-    const { email, name } = await request.json();
-    console.log('Registration data:', { email, name: name ? '[PROVIDED]' : '[NOT PROVIDED]' });
+    const body = await request.json().catch(() => ({}));
+    const rawUsername = typeof body.username === 'string' ? body.username.trim() : '';
+    const e2ePublicKey =
+      typeof body.e2ePublicKey === 'string' ? body.e2ePublicKey : null;
 
-    if (!email) {
-      console.log('Registration failed: Email is required');
+    if (rawUsername.length > 40) {
       return NextResponse.json(
-        { error: 'Email is required' },
-        { status: 400 }
+        { error: 'Username must be 40 characters or fewer' },
+        { status: 400 },
       );
     }
+    if (e2ePublicKey && e2ePublicKey.length > 512) {
+      return NextResponse.json({ error: 'Invalid key' }, { status: 400 });
+    }
 
-    // Check if user already exists
-    console.log('Checking if user exists:', email);
-    const existingUser = await db.user.findUnique({
-      where: { email },
+    await webAuthnService.purgeExpiredChallenges();
+
+    // Reuse an abandoned account that has no passkey yet, otherwise clean up
+    // any other passkey-less rows so retries don't pile up.
+    const orphan = await db.user.findFirst({
+      where: { passkeyCredentialId: null },
+      orderBy: { createdAt: 'desc' },
     });
-
-    if (existingUser) {
-      console.log('Registration failed: User already exists:', email);
-      return NextResponse.json(
-        { error: 'User already exists' },
-        { status: 400 }
-      );
+    if (orphan) {
+      await db.user.delete({ where: { id: orphan.id } }).catch(() => {});
     }
 
-    // Create user in database
-    console.log('Creating new user:', email);
     const user = await db.user.create({
       data: {
-        email,
-        name,
+        username: rawUsername || null,
+        e2ePublicKey,
       },
     });
-    console.log('User created successfully:', user.id);
 
-    // Generate E2E encryption key pair
-    console.log('Generating E2E encryption keys...');
-    const e2eKeyPair = cryptoUtils.generateKeyPair();
-    console.log('E2E keys generated successfully');
+    const options = await webAuthnService.createRegistrationChallenge(
+      user.id,
+      rawUsername || 'Anonymous',
+    );
 
-    // Update user with E2E keys
-    console.log('Updating user with E2E keys...');
-    await db.user.update({
-      where: { id: user.id },
-      data: {
-        e2ePublicKey: e2eKeyPair.publicKey,
-        e2ePrivateKey: e2eKeyPair.privateKey,
-      },
-    });
-    console.log('User updated with E2E keys successfully');
-
-    // Generate passkey registration options
-    console.log('Generating WebAuthn registration options...');
-    const options = webAuthnService.generateRegistrationOptions({
-      id: user.id,
-      email: user.email,
-      name: user.name,
-    });
-    console.log('WebAuthn options generated successfully');
-
-    // Store challenge in session or temporary storage
-    // For now, we'll use a simple approach (in production, use Redis)
-    const challenge = options.challenge;
-    
-    console.log('Registration initialization successful for user:', user.id);
-    return NextResponse.json({
-      options: options,
-      userId: user.id,
-      challenge: challenge,
-    });
+    return NextResponse.json({ options, userId: user.id });
   } catch (error) {
-    console.error('Registration start error details:', {
-      message: error instanceof Error ? error.message : 'Unknown error',
-      stack: error instanceof Error ? error.stack : undefined,
-      error: error
-    });
-    
-    // Return more specific error information in development
-    const isDevelopment = process.env.NODE_ENV === 'development';
+    console.error('register:start failed', error);
     return NextResponse.json(
-      {
-        error: 'Internal server error',
-        ...(isDevelopment && {
-          details: error instanceof Error ? error.message : 'Unknown error',
-          stack: error instanceof Error ? error.stack : undefined
-        })
-      },
-      { status: 500 }
+      { error: 'Could not start registration' },
+      { status: 500 },
     );
   }
 }

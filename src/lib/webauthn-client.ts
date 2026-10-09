@@ -1,162 +1,118 @@
-import {
-  startAuthentication,
-  startRegistration,
-} from '@simplewebauthn/browser';
-import {
+'use client';
+
+import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
+import type {
   AuthenticationResponseJSON,
+  PublicKeyCredentialCreationOptionsJSON,
+  PublicKeyCredentialRequestOptionsJSON,
   RegistrationResponseJSON,
-} from '@simplewebauthn/types';
+} from '@simplewebauthn/browser';
 
-export interface RegistrationOptions {
-  options: any;
-  userId: string;
-  challenge: string;
+export interface RegisterOptions {
+  options: PublicKeyCredentialCreationOptionsJSON;
 }
 
-export interface AuthenticationOptions {
-  options: any;
-  userId: string;
-  challenge: string;
+export interface AuthenticateOptions {
+  options: PublicKeyCredentialRequestOptionsJSON;
 }
 
-export class WebAuthnClient {
-  // Start passkey registration
-  async startRegistration(options: RegistrationOptions): Promise<RegistrationResponseJSON> {
-    try {
-      console.log('Starting registration with options:', options);
-      
-      if (!options || !options.options) {
-        throw new Error('Invalid registration options provided');
-      }
-
-      if (!options.options.challenge) {
-        throw new Error('Challenge is missing from registration options');
-      }
-
-      const result = await startRegistration(options.options);
-      console.log('Registration completed successfully:', result);
-      return result;
-    } catch (error) {
-      console.error('Registration start error:', error);
-      
-      if (error instanceof Error) {
-        throw new Error(`Failed to start passkey registration: ${error.message}`);
-      }
-      
-      throw new Error('Failed to start passkey registration');
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    if (error.name === 'NotAllowedError') {
+      return 'Passkey prompt was dismissed or timed out.';
     }
-  }
-
-  // Complete passkey registration
-  async completeRegistration(
-    options: RegistrationOptions,
-    credential: RegistrationResponseJSON
-  ): Promise<{ success: boolean; error?: string }> {
-    try {
-      const response = await fetch('/api/auth/register/complete', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          credential,
-          challenge: options.challenge,
-          userId: options.userId,
-        }),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        return { success: false, error: result.error || 'Registration failed' };
-      }
-
-      return { success: true };
-    } catch (error) {
-      console.error('Registration completion error:', error);
-      return { success: false, error: 'Network error during registration' };
+    if (error.name === 'InvalidStateError') {
+      return 'A passkey already exists for this account on this device.';
     }
-  }
-
-  // Start passkey authentication
-  async startAuthentication(options: AuthenticationOptions): Promise<AuthenticationResponseJSON> {
-    try {
-      console.log('Starting authentication with options:', options);
-      
-      if (!options || !options.options) {
-        throw new Error('Invalid authentication options provided');
-      }
-
-      if (!options.options.challenge) {
-        throw new Error('Challenge is missing from authentication options');
-      }
-
-      const result = await startAuthentication(options.options);
-      console.log('Authentication completed successfully:', result);
-      return result;
-    } catch (error) {
-      console.error('Authentication start error:', error);
-      
-      if (error instanceof Error) {
-        throw new Error(`Failed to start passkey authentication: ${error.message}`);
-      }
-      
-      throw new Error('Failed to start passkey authentication');
+    if (error.name === 'NotSupportedError') {
+      return 'This browser does not support passkeys.';
     }
+    return error.message;
   }
+  return 'Unknown error';
+}
 
-  // Complete passkey authentication
-  async completeAuthentication(
-    options: AuthenticationOptions,
-    credential: AuthenticationResponseJSON
-  ): Promise<{ success: boolean; user?: any; error?: string }> {
-    try {
-      const response = await fetch('/api/auth/login/complete', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          credential,
-          challenge: options.challenge,
-          userId: options.userId,
-        }),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        return { success: false, error: result.error || 'Authentication failed' };
-      }
-
-      return { success: true, user: result.user };
-    } catch (error) {
-      console.error('Authentication completion error:', error);
-      return { success: false, error: 'Network error during authentication' };
-    }
-  }
-
-  // Check if passkeys are supported
-  isSupported(): boolean {
-    if (typeof window === 'undefined') return false;
-    
-    return (
-      window.PublicKeyCredential !== undefined &&
-      typeof window.PublicKeyCredential === 'function' &&
-      window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable !== undefined
-    );
-  }
-
-  // Check if platform authenticator is available
-  async isPlatformAuthenticatorAvailable(): Promise<boolean> {
-    if (typeof window === 'undefined') return false;
-    
-    try {
-      return await window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
-    } catch {
-      return false;
-    }
+/** Thrown when the user closes the native prompt, so callers can stay quiet. */
+export class PasskeyCancelledError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PasskeyCancelledError';
   }
 }
 
-export const webAuthnClient = new WebAuthnClient();
+export async function registerPasskey(
+  options: RegisterOptions,
+): Promise<RegistrationResponseJSON> {
+  try {
+    return await startRegistration({ optionsJSON: options.options });
+  } catch (error) {
+    const message = describeError(error);
+    if (message.includes('dismissed')) {
+      throw new PasskeyCancelledError(message);
+    }
+    throw new Error(message);
+  }
+}
+
+export async function authenticatePasskey(
+  options: AuthenticateOptions,
+): Promise<AuthenticationResponseJSON> {
+  try {
+    // allowCredentials is empty, so the browser renders its own account picker.
+    return await startAuthentication({ optionsJSON: options.options });
+  } catch (error) {
+    const message = describeError(error);
+    if (message.includes('dismissed')) {
+      throw new PasskeyCancelledError(message);
+    }
+    throw new Error(message);
+  }
+}
+
+export interface PasskeySupport {
+  supported: boolean;
+  reason?: string;
+}
+
+/**
+ * Explains *why* passkeys are unavailable rather than just returning a bool.
+ * The overwhelmingly common cause is a non-secure origin: WebAuthn is only
+ * exposed on https, with localhost treated as secure. Browsing to a LAN IP or
+ * to http://0.0.0.0:3000 therefore removes window.PublicKeyCredential entirely.
+ */
+export function getPasskeySupport(): PasskeySupport {
+  if (typeof window === 'undefined') {
+    return { supported: false, reason: 'Waiting for the browser…' };
+  }
+
+  if (!window.isSecureContext) {
+    return {
+      supported: false,
+      reason:
+        'This page is not a secure context. Passkeys only work over HTTPS, or on exactly "localhost".',
+    };
+  }
+
+  if (typeof window.PublicKeyCredential === 'undefined') {
+    return {
+      supported: false,
+      reason: 'This browser does not implement WebAuthn.',
+    };
+  }
+
+  if (
+    typeof navigator.credentials?.create !== 'function' ||
+    typeof navigator.credentials?.get !== 'function'
+  ) {
+    return {
+      supported: false,
+      reason: 'The Web Credentials API is unavailable in this browser.',
+    };
+  }
+
+  return { supported: true };
+}
+
+export function isPasskeySupported(): boolean {
+  return getPasskeySupport().supported;
+}

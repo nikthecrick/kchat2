@@ -1,8 +1,8 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+// KChat — passkey-only chat
+//
+// Identity is the passkey, not an email or a username.
+// Usernames are optional, non-unique display labels.
+// Private encryption keys never touch the server: only the public half is stored.
 
 generator client {
   provider = "prisma-client-js"
@@ -14,60 +14,74 @@ datasource db {
 }
 
 model User {
-  id                   String    @id @default(cuid())
-  email                String    @unique
-  name                 String?
-  passkeyCredentialId  String?   @unique
-  passkeyPublicKey     String?
-  passkeyCounter       BigInt?
-  e2ePublicKey         String?
-  e2ePrivateKey        String?
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
-  
-  // Relations
-  sentMessages         Message[] @relation("SentMessages")
-  receivedMessages     Message[] @relation("ReceivedMessages")
-  chatSessions1        ChatSession[] @relation("Participant1Sessions")
-  chatSessions2        ChatSession[] @relation("Participant2Sessions")
+  id                  String    @id @default(cuid())
+  // Optional, non-unique. Null renders as "Anonymous".
+  username            String?
+  passkeyCredentialId String?   @unique
+  passkeyPublicKey    String?
+  passkeyCounter      BigInt?
+  // Client-generated X25519 public key. The matching private key stays in the
+  // browser's localStorage and is never transmitted.
+  e2ePublicKey        String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  sentMessages     Message[]    @relation("SentMessages")
+  receivedMessages Message[]    @relation("ReceivedMessages")
+  chatSessions1    ChatSession[] @relation("Participant1Sessions")
+  chatSessions2    ChatSession[] @relation("Participant2Sessions")
+  challenges       WebAuthnChallenge[]
+}
+
+// Challenges are persisted server-side so the client can never choose the value
+// it is later checked against. Previously the client echoed its own challenge
+// back to /complete, which made the ceremony self-referential and meaningless.
+model WebAuthnChallenge {
+  id        String   @id @default(cuid())
+  challenge String   @unique
+  // "registration" | "authentication"
+  type      String
+  // Nullable: an authentication challenge is issued before we know who will use it.
+  userId    String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([type])
+  @@index([expiresAt])
 }
 
 model ChatSession {
-  id                String    @id @default(cuid())
-  participant1Id    String
-  participant2Id    String
-  rootKey           String?
-  senderChainKey    String?
-  receiverChainKey  String?
-  senderRatchetKey  String?
-  receiverRatchetKey String?
-  messageCounter    BigInt    @default(0)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  
-  // Relations
-  participant1      User      @relation("Participant1Sessions", fields: [participant1Id], references: [id], onDelete: Cascade)
-  participant2      User      @relation("Participant2Sessions", fields: [participant2Id], references: [id], onDelete: Cascade)
-  messages          Message[]
-  
+  id             String   @id @default(cuid())
+  participant1Id String
+  participant2Id String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  participant1 User      @relation("Participant1Sessions", fields: [participant1Id], references: [id], onDelete: Cascade)
+  participant2 User      @relation("Participant2Sessions", fields: [participant2Id], references: [id], onDelete: Cascade)
+  messages      Message[]
+
   @@unique([participant1Id, participant2Id])
+  @@index([participant1Id])
+  @@index([participant2Id])
 }
 
 model Message {
-  id                String    @id @default(cuid())
-  chatSessionId     String
-  senderId          String
-  receiverId        String
-  encryptedContent  String
-  messageKey        String?
-  previousChainKey  String?
-  messageNumber     BigInt
-  timestamp         DateTime  @default(now())
-  delivered         Boolean   @default(false)
-  read              Boolean   @default(false)
-  
-  // Relations
-  chatSession       ChatSession @relation(fields: [chatSessionId], references: [id], onDelete: Cascade)
-  sender            User        @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
-  receiver          User        @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+  id           String   @id @default(cuid())
+  chatSessionId String
+  senderId     String
+  receiverId   String
+  // base64( nonce || secretbox_ciphertext ). Opaque to the server.
+  ciphertext   String
+  timestamp    DateTime @default(now())
+  delivered    Boolean  @default(false)
+  read         Boolean  @default(false)
+
+  chatSession ChatSession @relation(fields: [chatSessionId], references: [id], onDelete: Cascade)
+  sender      User        @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver    User        @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@index([chatSessionId, timestamp])
 }

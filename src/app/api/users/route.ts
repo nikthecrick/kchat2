@@ -1,55 +1,55 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { authenticateRequest } from '@/lib/auth';
+import { getSessionUser, DEFAULT_USERNAME } from '@/lib/auth';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+/**
+ * List users to start a conversation with.
+ *
+ * FIXED: the previous version used `mode: 'insensitive'`, which Prisma only
+ * supports on PostgreSQL and MongoDB. On SQLite every search threw at runtime,
+ * so the "find someone to chat with" box was permanently broken. SQLite's LIKE
+ * is already case-insensitive for ASCII, so no mode is needed.
+ *
+ * Only users who actually have a passkey are returned — someone still
+ * mid-registration is not yet discoverable.
+ */
 export async function GET(request: NextRequest) {
   try {
-    const user = await authenticateRequest(request);
-    if (!user) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
+    const me = await getSessionUser();
+    if (!me) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const { searchParams } = new URL(request.url);
-    const query = searchParams.get('q');
+    const query = (request.nextUrl.searchParams.get('q') ?? '').trim();
 
-    if (!query) {
-      return NextResponse.json(
-        { error: 'Search query is required' },
-        { status: 400 }
-      );
-    }
-
-    // Search users by email or name, excluding current user
     const users = await db.user.findMany({
       where: {
-        AND: [
-          { id: { not: user.id } },
-          {
-            OR: [
-              { email: { contains: query, mode: 'insensitive' } },
-              { name: { contains: query, mode: 'insensitive' } },
-            ],
-          },
-        ],
+        id: { not: me.id },
+        passkeyCredentialId: { not: null },
+        ...(query ? { username: { contains: query } } : {}),
       },
       select: {
         id: true,
-        email: true,
-        name: true,
+        username: true,
         createdAt: true,
+        _count: { select: { chatSessions1: true, chatSessions2: true } },
       },
-      take: 10, // Limit results to prevent abuse
+      orderBy: { createdAt: 'asc' },
+      take: 50,
     });
 
-    return NextResponse.json({ users });
+    return NextResponse.json({
+      users: users.map((u) => ({
+        id: u.id,
+        username: u.username,
+        displayName: u.username || DEFAULT_USERNAME,
+      })),
+    });
   } catch (error) {
-    console.error('Search users error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('users:list failed', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

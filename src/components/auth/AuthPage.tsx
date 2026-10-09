@@ -1,264 +1,128 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Loader2, Shield, Lock, UserPlus } from 'lucide-react';
-import { webAuthnClient } from '@/lib/webauthn-client';
+import { Loader2, Shield, Lock, UserPlus, Info } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import {
+  authenticatePasskey,
+  getPasskeySupport,
+  PasskeyCancelledError,
+  registerPasskey,
+} from '@/lib/webauthn-client';
+import {
+  exportPublicKey,
+  getOrCreateLocalKeyPair,
+} from '@/lib/crypto';
 
-interface AuthUser {
-  id: string;
-  email: string;
-  name?: string;
-}
+type Status = { kind: 'idle' | 'busy' | 'error' | 'ok'; message?: string };
 
 export default function AuthPage() {
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-  const [user, setUser] = useState<AuthUser | null>(null);
-  const [isClient, setIsClient] = useState(false);
+  const [status, setStatus] = useState<Status>({ kind: 'idle' });
+  const [username, setUsername] = useState('');
+  const [support, setSupport] = useState({ supported: true, reason: '' });
   const router = useRouter();
 
-  // Ensure we're on client side
   useEffect(() => {
-    setIsClient(true);
-  }, []);
+    setSupport(getPasskeySupport());
+    fetch('/api/auth/me')
+      .then((r) => {
+        if (r.ok) router.replace('/chat');
+      })
+      .catch(() => {});
+  }, [router]);
 
-  const handleRegister = async (email: string, name?: string) => {
-    if (!isClient) return;
-    
-    setIsLoading(true);
-    setError(null);
-    setSuccess(null);
+  async function handleRegister(e: React.FormEvent) {
+    e.preventDefault();
+    setStatus({ kind: 'busy' });
 
-    try {
-      console.log('Starting registration for email:', email);
-      
-      // Start registration
-      const regResponse = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ email, name }),
-      });
-
-      const regData = await regResponse.json();
-      console.log('Registration API response:', regData);
-
-      if (!regResponse.ok) {
-        throw new Error(regData.error || 'Registration failed');
-      }
-
-      setSuccess('Registration initiated. Please complete the passkey creation...');
-
-      // Complete registration with passkey
-      console.log('Calling webAuthnClient.startRegistration with:', regData);
-      const credential = await webAuthnClient.startRegistration(regData);
-      console.log('Passkey credential created:', credential);
-      
-      const completionResult = await webAuthnClient.completeRegistration(regData, credential);
-      console.log('Registration completion result:', completionResult);
-
-      if (!completionResult.success) {
-        throw new Error(completionResult.error || 'Passkey creation failed');
-      }
-
-      setSuccess('Account created successfully! You can now login.');
-      setIsLoading(false);
-    } catch (err) {
-      console.error('Registration error:', err);
-      setError(err instanceof Error ? err.message : 'Registration failed');
-      setIsLoading(false);
-    }
-  };
-
-  const handleLogin = async (email: string) => {
-    if (!isClient) return;
-    
-    setIsLoading(true);
-    setError(null);
-    setSuccess(null);
+    // Generate the encryption keypair here, in the browser. Only the public
+    // half is sent to the server; the private half stays in localStorage, which
+    // is what makes the encryption genuinely end-to-end.
+    const { publicKey } = getOrCreateLocalKeyPair();
 
     try {
-      console.log('Starting login for email:', email);
-      
-      // Start authentication
-      const authResponse = await fetch('/api/auth/login', {
+      const startRes = await fetch('/api/auth/register', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ email }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: username.trim(),
+          e2ePublicKey: exportPublicKey(publicKey),
+        }),
       });
+      const startData = await startRes.json();
+      if (!startRes.ok) throw new Error(startData.error || 'Registration failed');
 
-      const authData = await authResponse.json();
-      console.log('Login API response:', authData);
+      const credential = await registerPasskey({ options: startData.options });
 
-      if (!authResponse.ok) {
-        throw new Error(authData.error || 'Login failed');
-      }
+      const doneRes = await fetch('/api/auth/register/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential, challenge: startData.options.challenge }),
+      });
+      const doneData = await doneRes.json();
+      if (!doneRes.ok) throw new Error(doneData.error || 'Could not save passkey');
 
-      setSuccess('Authentication initiated. Please complete with your passkey...');
-
-      // Complete authentication with passkey
-      console.log('Calling webAuthnClient.startAuthentication with:', authData);
-      const credential = await webAuthnClient.startAuthentication(authData);
-      console.log('Passkey authentication completed:', credential);
-      
-      const completionResult = await webAuthnClient.completeAuthentication(authData, credential);
-      console.log('Login completion result:', completionResult);
-
-      if (!completionResult.success) {
-        throw new Error(completionResult.error || 'Authentication failed');
-      }
-
-      setUser(completionResult.user);
-      setSuccess('Login successful! Redirecting to chat...');
-      
-      // Redirect to chat after a short delay
-      setTimeout(() => {
-        router.push('/chat');
-      }, 1500);
+      setStatus({ kind: 'ok', message: 'Passkey created. Opening your chats…' });
+      router.replace('/chat');
     } catch (err) {
-      console.error('Login error:', err);
-      setError(err instanceof Error ? err.message : 'Login failed');
-      setIsLoading(false);
+      if (err instanceof PasskeyCancelledError) {
+        setStatus({ kind: 'idle' });
+        return;
+      }
+      setStatus({
+        kind: 'error',
+        message: err instanceof Error ? err.message : 'Registration failed',
+      });
     }
-  };
-
-  const RegisterForm = () => {
-    const [email, setEmail] = useState('');
-    const [name, setName] = useState('');
-
-    const handleSubmit = (e: React.FormEvent) => {
-      e.preventDefault();
-      handleRegister(email, name || undefined);
-    };
-
-    return (
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div className="space-y-2">
-          <Label htmlFor="reg-email">Email</Label>
-          <Input
-            id="reg-email"
-            type="email"
-            placeholder="Enter your email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-            disabled={isLoading}
-          />
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="reg-name">Name (Optional)</Label>
-          <Input
-            id="reg-name"
-            type="text"
-            placeholder="Enter your name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            disabled={isLoading}
-          />
-        </div>
-        <Button type="submit" className="w-full" disabled={isLoading}>
-          {isLoading ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Creating Passkey...
-            </>
-          ) : (
-            <>
-              <UserPlus className="mr-2 h-4 w-4" />
-              Create Account
-            </>
-          )}
-        </Button>
-      </form>
-    );
-  };
-
-  const LoginForm = () => {
-    const [email, setEmail] = useState('');
-
-    const handleSubmit = (e: React.FormEvent) => {
-      e.preventDefault();
-      handleLogin(email);
-    };
-
-    return (
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div className="space-y-2">
-          <Label htmlFor="login-email">Email</Label>
-          <Input
-            id="login-email"
-            type="email"
-            placeholder="Enter your email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-            disabled={isLoading}
-          />
-        </div>
-        <Button type="submit" className="w-full" disabled={isLoading}>
-          {isLoading ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Authenticating...
-            </>
-          ) : (
-            <>
-              <Lock className="mr-2 h-4 w-4" />
-              Login with Passkey
-            </>
-          )}
-        </Button>
-      </form>
-    );
-  };
-
-  // Show loading state until client is ready
-  if (!isClient) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-background p-4">
-        <Card className="w-full max-w-md">
-          <CardContent className="pt-6">
-            <div className="text-center space-y-4">
-              <div className="mx-auto w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center">
-                <Shield className="h-8 w-8 text-primary" />
-              </div>
-              <h2 className="text-2xl font-bold">Loading...</h2>
-              <p className="text-muted-foreground">Initializing authentication</p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    );
   }
 
-  if (user) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
-        <Card className="w-full max-w-md">
-          <CardContent className="pt-6">
-            <div className="text-center space-y-4">
-              <div className="mx-auto w-16 h-16 bg-green-100 rounded-full flex items-center justify-center">
-                <Shield className="h-8 w-8 text-green-600" />
-              </div>
-              <h2 className="text-2xl font-bold text-green-600">Welcome back!</h2>
-              <p className="text-muted-foreground">Redirecting you to chat...</p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-    );
+  async function handleLogin() {
+    setStatus({ kind: 'busy' });
+    try {
+      const startRes = await fetch('/api/auth/login', { method: 'POST' });
+      const startData = await startRes.json();
+      if (!startRes.ok) throw new Error(startData.error || 'Login failed');
+
+      const credential = await authenticatePasskey({ options: startData.options });
+
+      const doneRes = await fetch('/api/auth/login/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential, challenge: startData.options.challenge }),
+      });
+      const doneData = await doneRes.json();
+      if (!doneRes.ok) throw new Error(doneData.error || 'Login failed');
+
+      setStatus({ kind: 'ok', message: 'Welcome back!' });
+      router.replace('/chat');
+    } catch (err) {
+      if (err instanceof PasskeyCancelledError) {
+        setStatus({ kind: 'idle' });
+        return;
+      }
+      setStatus({
+        kind: 'error',
+        message: err instanceof Error ? err.message : 'Login failed',
+      });
+    }
   }
+
+  const busy = status.kind === 'busy';
+
+  const hostname =
+    typeof window !== 'undefined' ? window.location.hostname : '';
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-background p-4">
@@ -269,56 +133,104 @@ export default function AuthPage() {
           </div>
           <CardTitle className="text-2xl font-bold">KChat</CardTitle>
           <CardDescription>
-            End-to-End Encrypted Chat with Passkeys
+            Your passkey is your account. No email, no password.
           </CardDescription>
         </CardHeader>
+
         <CardContent>
+          {!support.supported && (
+            <Alert className="mb-4">
+              <Info className="h-4 w-4" />
+              <AlertDescription>
+                {support.reason}
+                <span className="mt-1 block text-xs opacity-80">
+                  You appear to be on{' '}
+                  <code className="font-mono">{hostname}</code>. Try{' '}
+                  <code className="font-mono">http://localhost:3000</code>.
+                </span>
+              </AlertDescription>
+            </Alert>
+          )}
+
           <Tabs defaultValue="login" className="w-full">
             <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="login">Login</TabsTrigger>
-              <TabsTrigger value="register">Register</TabsTrigger>
+              <TabsTrigger value="login">Sign in</TabsTrigger>
+              <TabsTrigger value="register">Create</TabsTrigger>
             </TabsList>
-            
-            <TabsContent value="login" className="space-y-4">
-              <div className="text-center mb-4">
-                <h3 className="text-lg font-semibold">Welcome Back</h3>
-                <p className="text-sm text-muted-foreground">
-                  Login securely with your passkey
-                </p>
-              </div>
-              <LoginForm />
+
+            <TabsContent value="login" className="space-y-4 pt-4">
+              <p className="text-sm text-muted-foreground text-center">
+                Pick a passkey from your device.
+              </p>
+              <Button
+                className="w-full"
+                onClick={handleLogin}
+                disabled={busy || !support.supported}
+              >
+                {busy ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Lock className="mr-2 h-4 w-4" />
+                )}
+                Sign in with a passkey
+              </Button>
             </TabsContent>
-            
-            <TabsContent value="register" className="space-y-4">
-              <div className="text-center mb-4">
-                <h3 className="text-lg font-semibold">Create Account</h3>
-                <p className="text-sm text-muted-foreground">
-                  Register with a secure passkey
-                </p>
-              </div>
-              <RegisterForm />
+
+            <TabsContent value="register" className="space-y-4 pt-4">
+              <form onSubmit={handleRegister} className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="username">Username (optional)</Label>
+                  <Input
+                    id="username"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    placeholder="Anonymous"
+                    maxLength={40}
+                    disabled={busy}
+                    autoComplete="off"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Only a display label — anyone can use the same one. Leave it
+                    blank and you&apos;ll be &quot;Anonymous&quot;.
+                  </p>
+                </div>
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={busy || !support.supported}
+                >
+                  {busy ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <UserPlus className="mr-2 h-4 w-4" />
+                  )}
+                  Create a passkey
+                </Button>
+              </form>
             </TabsContent>
           </Tabs>
 
-          {error && (
-            <Alert className="mt-4 border-destructive">
-              <AlertDescription className="text-destructive">
-                {error}
+          {status.message && (
+            <Alert
+              className={`mt-4 ${
+                status.kind === 'error'
+                  ? 'border-destructive'
+                  : 'border-green-200 bg-green-50'
+              }`}
+            >
+              <AlertDescription
+                className={
+                  status.kind === 'error' ? 'text-destructive' : 'text-green-800'
+                }
+              >
+                {status.message}
               </AlertDescription>
             </Alert>
           )}
 
-          {success && (
-            <Alert className="mt-4 border-green-200 bg-green-50">
-              <AlertDescription className="text-green-800">
-                {success}
-              </AlertDescription>
-            </Alert>
-          )}
-
-          <div className="mt-6 text-center text-xs text-muted-foreground">
-            <p>🔐 Passkeys provide phishing-resistant authentication</p>
-            <p>🔒 Messages are encrypted end-to-end</p>
+          <div className="mt-6 text-center text-xs text-muted-foreground space-y-1">
+            <p>🔑 Phishing-resistant, and there is no password to leak.</p>
+            <p>🔒 Messages are encrypted in your browser, not on the server.</p>
           </div>
         </CardContent>
       </Card>

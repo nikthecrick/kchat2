@@ -1,188 +1,100 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { authenticateRequest } from '@/lib/auth';
-import { cryptoUtils } from '@/lib/crypto';
+import { getSessionUser } from '@/lib/auth';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+/**
+ * Store an already-encrypted message.
+ *
+ * The server receives ciphertext it cannot read. There is no ratchet state in
+ * the payload and none on the server: the old design had the client POST its
+ * Double Ratchet state to the server on every message, which meant the server
+ * held enough material to derive the keys it was supposed to be blind to.
+ */
 export async function POST(request: NextRequest) {
   try {
-    const user = await authenticateRequest(request);
-    if (!user) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
+    const me = await getSessionUser();
+    if (!me) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const { chatSessionId, content, ratchetState } = await request.json();
+    const { chatSessionId, ciphertext } = await request.json();
 
-    if (!chatSessionId || !content || !ratchetState) {
-      return NextResponse.json(
-        { error: 'Missing required fields' },
-        { status: 400 }
-      );
+    if (!chatSessionId || typeof ciphertext !== 'string' || !ciphertext) {
+      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+    }
+    if (ciphertext.length > 20000) {
+      return NextResponse.json({ error: 'Message too large' }, { status: 413 });
     }
 
-    // Get chat session
     const session = await db.chatSession.findUnique({
       where: { id: chatSessionId },
-      include: {
-        participant1: { select: { id: true } },
-        participant2: { select: { id: true } },
-      },
+      select: { participant1Id: true, participant2Id: true },
     });
-
     if (!session) {
-      return NextResponse.json(
-        { error: 'Chat session not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Chat not found' }, { status: 404 });
+    }
+    if (session.participant1Id !== me.id && session.participant2Id !== me.id) {
+      return NextResponse.json({ error: 'Access denied' }, { status: 403 });
     }
 
-    // Verify user is part of the chat
-    if (session.participant1Id !== user.id && session.participant2Id !== user.id) {
-      return NextResponse.json(
-        { error: 'Access denied' },
-        { status: 403 }
-      );
-    }
+    const receiverId =
+      session.participant1Id === me.id ? session.participant2Id : session.participant1Id;
 
-    // Determine receiver
-    const receiverId = session.participant1Id === user.id ? session.participant2Id : session.participant1Id;
-
-    // Encrypt message using Double Ratchet
-    const { encryptedMessage, newState } = await cryptoUtils.encryptDoubleRatchet(
-      ratchetState,
-      content
-    );
-
-    // Save message to database
     const message = await db.message.create({
-      data: {
-        chatSessionId,
-        senderId: user.id,
-        receiverId,
-        encryptedContent: encryptedMessage.encryptedContent,
-        messageKey: encryptedMessage.messageKey,
-        previousChainKey: encryptedMessage.previousChainKey,
-        messageNumber: BigInt(encryptedMessage.messageNumber),
-      },
-      include: {
-        sender: {
-          select: { id: true, email: true, name: true },
-        },
-        receiver: {
-          select: { id: true, email: true, name: true },
-        },
-      },
+      data: { chatSessionId, senderId: me.id, receiverId, ciphertext },
+      select: { id: true, senderId: true, chatSessionId: true, timestamp: true },
     });
 
-    // Update chat session with new ratchet state
+    // Bump the session so it sorts to the top of the sidebar.
     await db.chatSession.update({
       where: { id: chatSessionId },
-      data: {
-        rootKey: newState.rootKey,
-        senderChainKey: newState.senderChainKey,
-        receiverChainKey: newState.receiverChainKey,
-        senderRatchetKey: newState.senderRatchetKey.publicKey,
-        receiverRatchetKey: newState.receiverRatchetKey.publicKey,
-        messageCounter: BigInt(newState.messageNumber),
-        updatedAt: new Date(),
-      },
+      data: { updatedAt: new Date() },
     });
 
-    return NextResponse.json({
-      message,
-      newRatchetState: newState,
-    });
+    return NextResponse.json({ message });
   } catch (error) {
-    console.error('Send message error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('chat/messages:send failed', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
+/** Fetch the ciphertext history for one conversation. */
 export async function GET(request: NextRequest) {
   try {
-    const user = await authenticateRequest(request);
-    if (!user) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
+    const me = await getSessionUser();
+    if (!me) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const { searchParams } = new URL(request.url);
-    const chatSessionId = searchParams.get('chatSessionId');
-    const page = parseInt(searchParams.get('page') || '1');
-    const limit = parseInt(searchParams.get('limit') || '50');
-
+    const chatSessionId = request.nextUrl.searchParams.get('chatSessionId');
     if (!chatSessionId) {
-      return NextResponse.json(
-        { error: 'Chat session ID is required' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'chatSessionId is required' }, { status: 400 });
     }
 
-    // Verify user is part of the chat
     const session = await db.chatSession.findUnique({
       where: { id: chatSessionId },
-      select: {
-        participant1Id: true,
-        participant2Id: true,
-      },
+      select: { participant1Id: true, participant2Id: true },
     });
-
     if (!session) {
-      return NextResponse.json(
-        { error: 'Chat session not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Chat not found' }, { status: 404 });
+    }
+    if (session.participant1Id !== me.id && session.participant2Id !== me.id) {
+      return NextResponse.json({ error: 'Access denied' }, { status: 403 });
     }
 
-    if (session.participant1Id !== user.id && session.participant2Id !== user.id) {
-      return NextResponse.json(
-        { error: 'Access denied' },
-        { status: 403 }
-      );
-    }
-
-    // Get messages with pagination
     const messages = await db.message.findMany({
       where: { chatSessionId },
-      include: {
-        sender: {
-          select: { id: true, email: true, name: true },
-        },
-        receiver: {
-          select: { id: true, email: true, name: true },
-        },
-      },
-      orderBy: { timestamp: 'desc' },
-      skip: (page - 1) * limit,
-      take: limit,
+      select: { id: true, senderId: true, ciphertext: true, timestamp: true },
+      orderBy: { timestamp: 'asc' },
+      take: 500,
     });
 
-    // Get total count for pagination
-    const totalCount = await db.message.count({
-      where: { chatSessionId },
-    });
-
-    return NextResponse.json({
-      messages: messages.reverse(), // Return in chronological order
-      pagination: {
-        page,
-        limit,
-        totalCount,
-        totalPages: Math.ceil(totalCount / limit),
-      },
-    });
+    return NextResponse.json({ messages });
   } catch (error) {
-    console.error('Get messages error:', error);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('chat/messages:list failed', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

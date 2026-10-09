@@ -1,43 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/db';
 import { webAuthnService } from '@/lib/webauthn';
 
-export async function POST(request: NextRequest) {
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+/**
+ * Begin login.
+ *
+ * There is deliberately no username or email parameter. A discoverable
+ * (resident) credential request returns an empty allowCredentials list, so the
+ * browser displays its own passkey picker and tells us which credential was
+ * used. The user types nothing.
+ */
+export async function POST() {
   try {
-    const { email } = await request.json();
-
-    if (!email) {
-      return NextResponse.json(
-        { error: 'Email is required' },
-        { status: 400 }
-      );
-    }
-
-    // Find user in database
-    const user = await db.user.findUnique({
-      where: { email },
-    });
-
-    if (!user || !user.passkeyCredentialId) {
-      return NextResponse.json(
-        { error: 'User not found or no passkey registered' },
-        { status: 404 }
-      );
-    }
-
-    // Generate authentication options
-    const options = webAuthnService.generateAuthenticationOptions(user);
-
-    return NextResponse.json({
-      options: options,
-      userId: user.id,
-      challenge: options.challenge,
-    });
+    await webAuthnService.purgeExpiredChallenges();
+    const options = await webAuthnService.createAuthenticationChallenge();
+    return NextResponse.json({ options });
   } catch (error) {
-    console.error('Login start error:', error);
+    console.error('login:start failed', error);
     return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
+      { error: 'Could not start login' },
+      { status: 500 },
     );
   }
 }

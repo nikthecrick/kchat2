@@ -1,143 +1,29 @@
-import { Server as NetServer } from 'http';
-import { NextApiRequest, NextApiResponse } from 'next';
-import { Server as ServerIO } from 'socket.io';
-import { authenticateRequest } from '@/lib/auth';
+import { NextResponse } from 'next/server';
 
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
+/**
+ * This route is intentionally inert.
+ *
+ * WebSocket connections are handled by the custom Node server (server.ts),
+ * which attaches Socket.IO directly to the HTTP server. That is the only place
+ * it can live — an App Router route handler has no access to the underlying
+ * HTTP server.
+ *
+ * The previous version of this file was a Pages Router handler
+ * (NextApiRequest + `export const config = { api: ... }`) sitting inside the
+ * App Router, which cannot work and broke the build.
+ *
+ * If a plain GET arrives here the Socket.IO layer did not claim it, so report
+ * that clearly rather than pretending something is wrong with the app.
+ */
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-const SocketHandler = (req: NextApiRequest, res: NextApiResponse & { socket: any }) => {
-  if (res.socket.server.io) {
-    console.log('Socket is already running');
-  } else {
-    console.log('Socket is initializing');
-    const httpServer: NetServer = res.socket.server as any;
-    const io = new ServerIO(httpServer, {
-      path: '/api/socket/io',
-      addTrailingSlash: false,
-      cors: {
-        origin: process.env.NODE_ENV === 'production' 
-          ? 'https://your-domain.com' 
-          : 'https://localhost:3000',
-        methods: ['GET', 'POST'],
-      },
-    });
-
-    // Authentication middleware for Socket.io
-    io.use(async (socket, next) => {
-      try {
-        const token = socket.handshake.auth.token;
-        if (!token) {
-          return next(new Error('Authentication error'));
-        }
-
-        // Create a mock request object for authentication
-        const mockRequest = {
-          cookies: {
-            get: (name: string) => name === 'session-token' ? token : null,
-          },
-        } as any;
-
-        const user = await authenticateRequest(mockRequest);
-        if (!user) {
-          return next(new Error('Authentication error'));
-        }
-
-        socket.data.user = user;
-        next();
-      } catch (error) {
-        next(new Error('Authentication error'));
-      }
-    });
-
-    io.on('connection', (socket) => {
-      const user = socket.data.user;
-      console.log(`User ${user.email} connected`);
-
-      // Join user to their personal room for private messages
-      socket.join(`user:${user.id}`);
-
-      // Handle joining chat sessions
-      socket.on('join-chat', (chatSessionId: string) => {
-        socket.join(`chat:${chatSessionId}`);
-        console.log(`User ${user.email} joined chat ${chatSessionId}`);
-      });
-
-      // Handle leaving chat sessions
-      socket.on('leave-chat', (chatSessionId: string) => {
-        socket.leave(`chat:${chatSessionId}`);
-        console.log(`User ${user.email} left chat ${chatSessionId}`);
-      });
-
-      // Handle typing indicators
-      socket.on('typing', (data: { chatSessionId: string; isTyping: boolean }) => {
-        socket.to(`chat:${data.chatSessionId}`).emit('user-typing', {
-          userId: user.id,
-          userName: user.name || user.email,
-          isTyping: data.isTyping,
-        });
-      });
-
-      // Handle new messages
-      socket.on('new-message', (data: {
-        chatSessionId: string;
-        messageId: string;
-        content: string;
-        receiverId: string;
-      }) => {
-        // Send to specific user if they're in the chat
-        socket.to(`user:${data.receiverId}`).emit('message-received', {
-          chatSessionId: data.chatSessionId,
-          messageId: data.messageId,
-          senderId: user.id,
-          senderName: user.name || user.email,
-          content: data.content,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Also send to chat room for real-time updates
-        socket.to(`chat:${data.chatSessionId}`).emit('message-received', {
-          chatSessionId: data.chatSessionId,
-          messageId: data.messageId,
-          senderId: user.id,
-          senderName: user.name || user.email,
-          content: data.content,
-          timestamp: new Date().toISOString(),
-        });
-      });
-
-      // Handle message read status
-      socket.on('mark-read', (data: { chatSessionId: string; messageId: string }) => {
-        socket.to(`chat:${data.chatSessionId}`).emit('message-read', {
-          messageId: data.messageId,
-          readBy: user.id,
-        });
-      });
-
-      // Handle user online status
-      socket.on('user-online', () => {
-        socket.broadcast.emit('user-status', {
-          userId: user.id,
-          status: 'online',
-        });
-      });
-
-      // Handle disconnection
-      socket.on('disconnect', () => {
-        console.log(`User ${user.email} disconnected`);
-        socket.broadcast.emit('user-status', {
-          userId: user.id,
-          status: 'offline',
-        });
-      });
-    });
-
-    res.socket.server.io = io;
-  }
-  res.end();
-};
-
-export default SocketHandler;
+export async function GET() {
+  return NextResponse.json(
+    {
+      error: 'Expected a WebSocket upgrade request.',
+      hint: 'Connect a Socket.IO client to /api/socket/io, or start the app with `npm run dev`.',
+    },
+    { status: 426 },
+  );
+}

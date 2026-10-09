@@ -1,28 +1,30 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
-  output: "standalone",
+  output: 'standalone',
+
+  // These were both set to `true`, which is almost certainly why the broken
+  // WebAuthn import and the incompatible socket route went unnoticed for so
+  // long. Real type errors should fail the build.
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
-  reactStrictMode: false,
-  // For production deployment with nginx
-  serverExternalPackages: ['@simplewebauthn/server', 'tweetnacl', 'libsodium-wrappers', 'prisma', '@prisma/client'],
   eslint: {
-    ignoreDuringBuilds: true,
+    ignoreDuringBuilds: false,
   },
-  // Handle deployment behind proxy
-  assetPrefix: process.env.NODE_ENV === 'production' ? undefined : undefined,
-  // Configure for custom domains
-  async rewrites() {
-    return [
-      // Handle socket.io
-      {
-        source: '/api/socket/io/:path*',
-        destination: '/api/socket/io/:path*',
-      },
-    ];
-  },
+
+  reactStrictMode: false,
+
+  // Hide the Next.js dev-tools badge (the "N" that offers to try Turbopack).
+  // Development-only overlay; compile and runtime errors are still reported.
+  devIndicators: false,
+
+  serverExternalPackages: [
+    '@simplewebauthn/server',
+    'jsonwebtoken',
+    '@prisma/client',
+    'tweetnacl',
+  ],
 };
 
 export default nextConfig;

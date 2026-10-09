@@ -16,9 +16,10 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "KChat - End-to-End Encrypted Chat",
-  description: "A production-ready, end-to-end encrypted chat application that leverages Passkeys for secure authentication and the Double Ratchet algorithm for message encryption.",
-  keywords: ["Passkey", "WebAuthn", "Encryption", "Chat", "Double Ratchet", "E2E", "Security", "KChat"],
+  title: "KChat - Passkey Chat",
+  description:
+    "Passwordless chat with passkey authentication and client-side end-to-end encryption.",
+  keywords: ["Passkey", "WebAuthn", "Encryption", "Chat", "E2E", "Security", "KChat"],
   authors: [{ name: "KChat Team" }],
   icons: {
     icon: "/logo.svg",
