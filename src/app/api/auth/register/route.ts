@@ -36,13 +36,16 @@ export async function POST(request: NextRequest) {
 
     await webAuthnService.purgeExpiredChallenges();
 
-    // Reuse an abandoned account that has no passkey yet, otherwise clean up
-    // any other passkey-less rows so retries don't pile up.
-    const orphan = await db.user.findFirst({
-      where: { passkeyCredentialId: null },
-      orderBy: { createdAt: 'desc' },
+    // Clean up abandoned accounts from earlier attempts. Only rows older than
+    // ten minutes are eligible: deleting every passkey-less user outright would
+    // break two people registering at the same time, since the second request
+    // would wipe out the first one's pending account.
+    const staleBefore = new Date(Date.now() - 10 * 60 * 1000);
+    const orphans = await db.user.findMany({
+      where: { passkeyCredentialId: null, createdAt: { lt: staleBefore } },
+      select: { id: true },
     });
-    if (orphan) {
+    for (const orphan of orphans) {
       await db.user.delete({ where: { id: orphan.id } }).catch(() => {});
     }
 
@@ -60,10 +63,12 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ options, userId: user.id });
   } catch (error) {
+    // Returning a generic message here made this impossible to diagnose from
+    // the browser. Surface the real cause — it is almost always a missing
+    // migration or an unset ORIGIN/RP_ID. See /api/health.
+    const message =
+      error instanceof Error ? error.message : 'Unknown registration error';
     console.error('register:start failed', error);
-    return NextResponse.json(
-      { error: 'Could not start registration' },
-      { status: 500 },
-    );
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
