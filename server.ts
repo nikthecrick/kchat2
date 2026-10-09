@@ -14,7 +14,9 @@ import { Server as SocketIOServer } from 'socket.io';
 import jwt from 'jsonwebtoken';
 
 const dev = process.env.NODE_ENV !== 'production';
-const hostname = process.env.HOSTNAME || '0.0.0.0';
+// Always bind 0.0.0.0. Render sets HOSTNAME to the service name, so trusting
+// it would make the server bind to a hostname that isn't resolvable locally.
+const hostname = '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 
 const SESSION_COOKIE = 'kchat-session';

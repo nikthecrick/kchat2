@@ -18,6 +18,7 @@ import { useRouter } from 'next/navigation';
 import {
   authenticatePasskey,
   getPasskeySupport,
+  type PasskeySupport,
   PasskeyCancelledError,
   registerPasskey,
 } from '@/lib/webauthn-client';
@@ -31,7 +32,7 @@ type Status = { kind: 'idle' | 'busy' | 'error' | 'ok'; message?: string };
 export default function AuthPage() {
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
   const [username, setUsername] = useState('');
-  const [support, setSupport] = useState({ supported: true, reason: '' });
+  const [support, setSupport] = useState<PasskeySupport>({ supported: true });
   const router = useRouter();
 
   useEffect(() => {

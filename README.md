@@ -18,21 +18,30 @@ that is what you are called.
 
 ## Setup
 
+You need a PostgreSQL database. Locally, any of these work:
+
+```bash
+# Option A: a local Postgres
+createdb kchat
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/kchat?schema=public"
+
+# Option B: no local install — a throwaway free Postgres
+npx prisma init --datasource-provider postgresql
+```
+
+Then:
+
 ```bash
 npm install
-cp .env.example .env      # then edit JWT_SECRET
-npm run setup             # prisma generate + db push
+cp .env.example .env      # then edit DATABASE_URL and JWT_SECRET
+npm run setup             # prisma generate + prisma migrate dev (creates migration)
 npm run dev
 ```
 
 Open **http://localhost:3000**.
 
-### Passkeys and secure contexts
-
-Browsers only allow WebAuthn on HTTPS, with one exception: `localhost` counts
-as secure. That is why `RP_ID=localhost` must stay `localhost` in development.
-A passkey created on `localhost` is bound to that name and **will not** work on
-a LAN IP or a tunnel domain — you must re-register there.
+Note: `npm run db:push` is for throwaway databases only. Once there is real
+data, use `npm run db:migrate` (dev) and `npm run db:deploy` (production).
 
 To generate a real secret:
 
@@ -70,7 +79,9 @@ supposed to be blind to. All of that has been removed.
   to the design; adding recovery means adding some trusted second factor.
 - Because usernames are not unique, two anonymous users appear identically in
   the browser's passkey picker.
-- SQLite is fine for a handful of users. Concurrent writes will serialise.
+- **The server can substitute public keys**, so this is not yet hardened
+  against an actively malicious server. Safety-number verification is the fix
+  and is not implemented yet. See "Adding key verification" below.
 
 ## Architecture
 
@@ -110,5 +121,44 @@ the client cannot choose the value it is later verified against.
 
 ## Deployment
 
-Set `RP_ID` and `ORIGIN` to your real domain, use a strong `JWT_SECRET`, and put
-it behind TLS. Passkeys will not work over plain HTTP on a real domain.
+Set these environment variables:
+
+| Variable       | Value                                      |
+| -------------- | ------------------------------------------ |
+| `DATABASE_URL` | Postgres URL (use Render's *Internal* URL) |
+| `RP_ID`        | your exact domain, e.g. `kchat2.onrender.com` |
+| `ORIGIN`       | `https://yourdomain`                       |
+| `JWT_SECRET`   | a long random string                      |
+
+Use a start command that applies migrations before booting:
+
+```
+prisma migrate deploy && npm start
+```
+
+Two things that bite on Render specifically:
+
+- **Set `RP_ID` and `ORIGIN` to the real domain.** Passkeys are bound to it, so
+  accounts created on `localhost` will not work in production. Users register
+  fresh there.
+- **Free instances sleep after ~15 minutes idle.** WebSockets drop and the
+  first request after waking takes ~30 seconds. Use a paid instance if chat
+  needs to feel reliable.
+
+## Adding key verification (not implemented yet)
+
+The current design defends against a server that reads data it is given. It
+does not defend against a server that *substitutes* a public key and reads the
+traffic it then decrypts.
+
+The fix is a safety number both sides compute **in the browser**, from the
+sorted pair of public keys:
+
+```
+sorted(pubA, pubB) -> SHA-256 -> digits, grouped for reading
+```
+
+Since it is derived client-side, the server cannot forge it. Users compare it
+through a channel the server does not control — read aloud, scanned as a QR
+code, or sent over another app. A conversation stays flagged "unverified" until
+that comparison is done, and re-flags if the peer's public key ever changes.

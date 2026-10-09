@@ -8,10 +8,10 @@ export const dynamic = 'force-dynamic';
 /**
  * List users to start a conversation with.
  *
- * FIXED: the previous version used `mode: 'insensitive'`, which Prisma only
- * supports on PostgreSQL and MongoDB. On SQLite every search threw at runtime,
- * so the "find someone to chat with" box was permanently broken. SQLite's LIKE
- * is already case-insensitive for ASCII, so no mode is needed.
+ * On the original SQLite setup this used `mode: 'insensitive'`, which Prisma
+ * only supports on PostgreSQL and MongoDB — every search threw at runtime, so
+ * the "find someone to chat with" box was permanently broken. It works now
+ * that the database is PostgreSQL.
  *
  * Only users who actually have a passkey are returned — someone still
  * mid-registration is not yet discoverable.
@@ -29,7 +29,9 @@ export async function GET(request: NextRequest) {
       where: {
         id: { not: me.id },
         passkeyCredentialId: { not: null },
-        ...(query ? { username: { contains: query } } : {}),
+        ...(query
+          ? { username: { contains: query, mode: 'insensitive' } }
+          : {}),
       },
       select: {
         id: true,
