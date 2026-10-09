@@ -80,6 +80,15 @@ export function exportPublicKey(publicKey: Uint8Array): string {
   return toBase64(publicKey);
 }
 
+/** Hash used to fingerprint a safety number for server-side comparison. */
+export async function hashString(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 export function importPublicKey(value: string): Uint8Array {
   return fromBase64(value);
 }

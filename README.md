@@ -79,18 +79,19 @@ supposed to be blind to. All of that has been removed.
   to the design; adding recovery means adding some trusted second factor.
 - Because usernames are not unique, two anonymous users appear identically in
   the browser's passkey picker.
-- **The server can substitute public keys**, so this is not yet hardened
-  against an actively malicious server. Safety-number verification is the fix
-  and is not implemented yet. See "Adding key verification" below.
+- **The server could substitute public keys**, which would defeat the
+  encryption silently. Safety numbers (see below) let two users detect this by
+  comparing a value the server cannot forge.
 
 ## Architecture
 
 ```
 server.ts              custom Node server: Next + Socket.IO on one HTTP server
-prisma/schema.prisma   User, WebAuthnChallenge, ChatSession, Message
+prisma/schema.prisma   User, WebAuthnChallenge, ChatSession, Message, VerifiedKeyPair
 src/lib/webauthn.ts    server-side ceremony + challenge storage
 src/lib/webauthn-client.ts   browser ceremony
 src/lib/crypto.ts      X25519 + secretbox (browser only)
+src/lib/safety-number.ts     client-side safety-number derivation
 src/lib/auth.ts        JWT session cookie (httpOnly)
 ```
 
@@ -115,6 +116,10 @@ server reads it from the handshake headers instead. (The previous client used
 | POST   | `/api/chat/session`         | Start a conversation                 |
 | GET    | `/api/chat/messages`        | Ciphertext history                   |
 | POST   | `/api/chat/messages`        | Store a message                      |
+| GET    | `/api/verify?peerId=`       | Verification status, key-change flag  |
+| POST   | `/api/verify`               | Mark a pair verified                 |
+| DELETE | `/api/verify?peerId=`       | Revoke a verification                |
+| GET    | `/api/health`               | Deployment diagnostics               |
 
 Challenges are stored server-side in `WebAuthnChallenge` and deleted on use, so
 the client cannot choose the value it is later verified against.
@@ -145,20 +150,41 @@ Two things that bite on Render specifically:
   first request after waking takes ~30 seconds. Use a paid instance if chat
   needs to feel reliable.
 
-## Adding key verification (not implemented yet)
+## Key verification (safety numbers)
 
-The current design defends against a server that reads data it is given. It
-does not defend against a server that *substitutes* a public key and reads the
-traffic it then decrypts.
+Without this, the encryption has a real hole: the server holds both users'
+public keys, so a malicious or compromised server could substitute its own key
+in place of one user's, decrypt the traffic, and re-encrypt it for the other
+party. Neither side would notice anything wrong.
 
-The fix is a safety number both sides compute **in the browser**, from the
-sorted pair of public keys:
+Safety numbers close that gap. Both sides derive the same number **in the
+browser**, from the sorted pair of public keys:
 
 ```
-sorted(pubA, pubB) -> SHA-256 -> digits, grouped for reading
+sorted(pubA, pubB) -> SHA-256("kchat-safety-v1|…") -> 60 digits
 ```
 
-Since it is derived client-side, the server cannot forge it. Users compare it
-through a channel the server does not control — read aloud, scanned as a QR
-code, or sent over another app. A conversation stays flagged "unverified" until
-that comparison is done, and re-flags if the peer's public key ever changes.
+Sorting makes the result identical from either end of the conversation, so
+Alice and Bob see the same number. A human then compares them through a channel
+the server cannot observe. If a key was substituted, the numbers differ and the
+mismatch becomes visible.
+
+**How to verify:** open a conversation, click the shield in the header, and
+compare the QR code or the 60 digits (12 groups of 5) against what the other
+person sees. Scanning the QR with a phone camera is quickest — it displays the
+digits, which are then compared by eye. Alternatively, type the digits they read
+to you into the validation box. The number never leaves the browser.
+
+Verified state is stored server-side so it follows the account across devices.
+The server learns only *that* a pair was verified plus a hash of the number,
+which is of no use to it since it already holds both public keys.
+
+**Re-verification is automatic.** The hash is recomputed whenever a conversation
+is opened. If a peer's public key changes, the header switches to `Key changed`
+and asks for verification again — catching a substitution made *after* an
+initial verification.
+
+**The limit of this scheme:** it is trust-on-first-verify. If keys are
+substituted before anyone ever compares numbers, those substituted numbers get
+confirmed. Signal has the same property; it is inherent to the approach rather
+than a flaw in this implementation.

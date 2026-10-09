@@ -13,13 +13,23 @@ import {
   Moon,
   Sun,
   Lock,
+  ShieldCheck,
+  ShieldAlert,
 } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
 import { useRouter } from 'next/navigation';
 import { useTheme } from 'next-themes';
 import { LoadingPage } from '@/components/Loading';
 import ErrorBoundary from '@/components/ErrorBoundary';
-import { decryptFrom, encryptFor, getOrCreateLocalKeyPair } from '@/lib/crypto';
+import {
+  decryptFrom,
+  encryptFor,
+  exportPublicKey,
+  getOrCreateLocalKeyPair,
+  hashString,
+} from '@/lib/crypto';
+import { VerifyDialog, type VerifyStatus } from '@/components/VerifyDialog';
+import { deriveSafetyNumberAsync } from '@/lib/safety-number';
 
 interface Peer {
   id: string;
@@ -66,6 +76,9 @@ export default function ChatPage() {
   const [peerTyping, setPeerTyping] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [verifyOpen, setVerifyOpen] = useState(false);
+  const [verifyStatus, setVerifyStatus] = useState<VerifyStatus>('unverified');
+  const publicKeyRef = useRef<string | null>(null);
   const router = useRouter();
   const { theme, setTheme } = useTheme();
   const socketRef = useRef<Socket | null>(null);
@@ -83,7 +96,9 @@ export default function ChatPage() {
           return;
         }
         const user: Me = await res.json();
-        privateKeyRef.current = getOrCreateLocalKeyPair().privateKey;
+        const pair = getOrCreateLocalKeyPair();
+        privateKeyRef.current = pair.privateKey;
+        publicKeyRef.current = exportPublicKey(pair.publicKey);
         setMe(user);
       } catch {
         router.replace('/');
@@ -105,12 +120,43 @@ export default function ChatPage() {
     }
   }, []);
 
+  /** Look up whether this conversation has been verified for the active peer. */
+  const refreshVerification = useCallback(async (session: Session) => {
+    const mine = publicKeyRef.current;
+    if (!mine || !session.peer.publicKey) {
+      setVerifyStatus('unverified');
+      return;
+    }
+    try {
+      const number = await deriveSafetyNumberAsync(mine, session.peer.publicKey);
+      const hash = await hashString(number);
+      const res = await fetch(
+        `/api/verify?peerId=${encodeURIComponent(session.peer.id)}&numberHash=${hash}`,
+      );
+      if (!res.ok) {
+        setVerifyStatus('unverified');
+        return;
+      }
+      const data = await res.json();
+      setVerifyStatus(
+        data.status === 'verified'
+          ? 'verified'
+          : data.status === 'changed'
+            ? 'changed'
+            : 'unverified',
+      );
+    } catch {
+      setVerifyStatus('unverified');
+    }
+  }, []);
+
   /** Select a conversation, join its room, and decrypt its history. */
   const openSessionWith = useCallback(async (session: Session) => {
     activeRef.current = session;
     setActive(session);
     setError(null);
     socketRef.current?.emit('join-chat', session.id);
+    void refreshVerification(session);
 
     const priv = privateKeyRef.current;
     const peerPub = session.peer.publicKey;
@@ -148,7 +194,7 @@ export default function ChatPage() {
         }
       }),
     );
-  }, []);
+  }, [refreshVerification]);
 
   useEffect(() => {
     if (!me) return;
@@ -351,7 +397,7 @@ export default function ChatPage() {
               </Avatar>
               <div>
                 <div className="font-medium">{active.peer.displayName}</div>
-                <div className="text-xs text-muted-foreground flex items-center gap-1">
+                <div className="text-sm text-muted-foreground flex items-center gap-1">
                   {peerTyping ? (
                     'Typing…'
                   ) : (
@@ -362,6 +408,27 @@ export default function ChatPage() {
                   )}
                 </div>
               </div>
+              <button
+                onClick={() => setVerifyOpen(true)}
+                className="ml-auto flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors hover:bg-accent"
+              >
+                {verifyStatus === 'verified' ? (
+                  <>
+                    <ShieldCheck className="h-3.5 w-3.5 text-green-600" />
+                    <span className="text-green-700">Verified</span>
+                  </>
+                ) : verifyStatus === 'changed' ? (
+                  <>
+                    <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
+                    <span className="text-amber-700">Key changed</span>
+                  </>
+                ) : (
+                  <>
+                    <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
+                    <span className="text-amber-700">Not verified</span>
+                  </>
+                )}
+              </button>
             </div>
 
             <ScrollArea className="flex-1 p-4">
@@ -429,6 +496,19 @@ export default function ChatPage() {
           </div>
         )}
       </div>
+
+      {active && (
+        <VerifyDialog
+          open={verifyOpen}
+          onOpenChange={setVerifyOpen}
+          peerId={active.peer.id}
+          peerName={active.peer.displayName}
+          myPublicKey={publicKeyRef.current ?? ''}
+          peerPublicKey={active.peer.publicKey}
+          status={verifyStatus}
+          onStatusChange={setVerifyStatus}
+        />
+      )}
     </ErrorBoundary>
   );
 }

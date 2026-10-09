@@ -31,6 +31,35 @@ model User {
   chatSessions1    ChatSession[] @relation("Participant1Sessions")
   chatSessions2    ChatSession[] @relation("Participant2Sessions")
   challenges       WebAuthnChallenge[]
+  verificationsAsA VerifiedKeyPair[] @relation("VerifiedByA")
+  verificationsAsB VerifiedKeyPair[] @relation("VerifiedByB")
+}
+
+// Records that two users have compared safety numbers for a conversation.
+//
+// The server stores only the two user IDs and a hash of the safety number.
+// Storing this here (rather than in the browser) means the verified state
+// follows the account across devices.
+//
+// Note what the server does NOT get here: it never sees the safety number
+// itself, and it cannot influence how the number is derived. The protection
+// comes entirely from the two humans comparing numbers out of band — this
+// table only remembers that they did.
+model VerifiedKeyPair {
+  id        String   @id @default(cuid())
+  userAId   String
+  userBId   String
+  // SHA-256 of the derived safety number, stored so a later key change can be
+  // detected by recomputing and comparing.
+  numberHash String
+  verifiedAt DateTime @default(now())
+
+  userA User @relation("VerifiedByA", fields: [userAId], references: [id], onDelete: Cascade)
+  userB User @relation("VerifiedByB", fields: [userBId], references: [id], onDelete: Cascade)
+
+  @@unique([userAId, userBId])
+  @@index([userAId])
+  @@index([userBId])
 }
 
 // Challenges are persisted server-side so the client can never choose the value
