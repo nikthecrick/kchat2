@@ -10,8 +10,20 @@
  */
 import { createServer } from 'http';
 import next from 'next';
+import { loadEnvConfig } from '@next/env';
 import { Server as SocketIOServer } from 'socket.io';
 import jwt from 'jsonwebtoken';
+
+/**
+ * Load .env before anything reads process.env.
+ *
+ * Next only loads env files as part of `next()` / app.prepare(). A custom
+ * server runs top-level code before that happens, so without this explicit
+ * load a perfectly good local .env would be invisible and the server would
+ * exit even though nothing was actually misconfigured. Real environment
+ * variables (Render, Docker) take precedence and are never overwritten.
+ */
+loadEnvConfig(process.cwd());
 
 const dev = process.env.NODE_ENV !== 'production';
 // Always bind 0.0.0.0. Render sets HOSTNAME to the service name, so trusting
