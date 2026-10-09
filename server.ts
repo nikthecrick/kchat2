@@ -21,6 +21,42 @@ const port = Number(process.env.PORT || 3000);
 
 const SESSION_COOKIE = 'kchat-session';
 
+/**
+ * Fail fast on missing configuration.
+ *
+ * Without this, a missing DATABASE_URL doesn't surface until the first request
+ * that touches Prisma, which reads as an unrelated 500 several minutes after
+ * deploy.
+ */
+function assertConfiguration(): void {
+  const missing: string[] = [];
+
+  if (!process.env.DATABASE_URL) {
+    missing.push('DATABASE_URL (PostgreSQL connection string)');
+  }
+  if (!process.env.JWT_SECRET) {
+    missing.push('JWT_SECRET');
+  }
+  if (!process.env.ORIGIN) {
+    missing.push('ORIGIN (e.g. https://your-app.onrender.com)');
+  }
+  if (!process.env.RP_ID) {
+    missing.push('RP_ID (your domain, without https://)');
+  }
+
+  if (missing.length > 0) {
+    console.error('\n  ✗ Cannot start: missing environment variables\n');
+    for (const name of missing) console.error(`      - ${name}`);
+    console.error(
+      '\n  Set these in your host provider. RP_ID must be your domain exactly,\n' +
+        '  with no scheme or path — passkeys will not work otherwise.\n',
+    );
+    process.exit(1);
+  }
+}
+
+assertConfiguration();
+
 function readCookie(header: string | undefined, name: string): string | undefined {
   if (!header) return undefined;
   for (const part of header.split(';')) {
