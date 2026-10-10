@@ -40,8 +40,16 @@ npm run dev
 
 Open **http://localhost:3000**.
 
-Note: `npm run db:push` is for throwaway databases only. Once there is real
-data, use `npm run db:migrate` (dev) and `npm run db:deploy` (production).
+Notes:
+
+- `npm run db:push` is for throwaway databases only. Once there is real
+  data, use `npm run db:migrate` (dev) and `npm run db:deploy` (production).
+
+- If you created the schema earlier with `db push` rather than a migration,
+  Prisma will refuse to apply migrations to it (P3005). Baseline it once with
+  `npx prisma migrate resolve --applied 20260101000000_init`, which records
+  the existing schema as already applied without touching the data. See
+  "Deploying to Render" below.
 
 To generate a real secret:
 
@@ -119,6 +127,10 @@ server reads it from the handshake headers instead. (The previous client used
 | GET    | `/api/verify?peerId=`       | Verification status, key-change flag  |
 | POST   | `/api/verify`               | Mark a pair verified                 |
 | DELETE | `/api/verify?peerId=`       | Revoke a verification                |
+| GET    | `/api/verify-request`       | List verification requests           |
+| POST   | `/api/verify-request`       | Ask someone to verify                |
+| PUT    | `/api/verify-request`       | Mark a request seen / completed      |
+| DELETE | `/api/verify-request?id=`   | Cancel a request you sent            |
 | GET    | `/api/health`               | Deployment diagnostics               |
 
 Challenges are stored server-side in `WebAuthnChallenge` and deleted on use, so
@@ -140,6 +152,25 @@ Use a start command that applies migrations before booting:
 ```
 prisma migrate deploy && npm start
 ```
+
+That command must not be the **build** command — Render builds first, and
+migrations belong at startup, not at build time. If Render reports "Running
+build command 'prisma migrate deploy && npm start'", move that string into
+Settings → Start Command and restore the build command to
+`npm install; npm run build`.
+
+**If you previously used `db push` to create the schema** (which is what this
+project's early setup did), the database is not empty but has no migration
+history, so `migrate deploy` stops with P3005. Baseline it once:
+
+```bash
+DATABASE_URL="<your postgres url>" npx prisma migrate resolve --applied 20260101000000_init
+```
+
+This marks the existing schema as already applied and records it in
+`_prisma_migrations` without dropping or recreating anything. After that,
+`migrate deploy` works normally. Only run it against the database whose
+schema matches that migration — never to paper over a genuine mismatch.
 
 Two things that bite on Render specifically:
 
@@ -174,6 +205,17 @@ compare the QR code or the 60 digits (12 groups of 5) against what the other
 person sees. Scanning the QR with a phone camera is quickest — it displays the
 digits, which are then compared by eye. Alternatively, type the digits they read
 to you into the validation box. The number never leaves the browser.
+
+**Asking someone to verify:** the same dialog has an "Ask {name} to verify"
+button. It drops a request into their inbox — visible in the sidebar and pushed
+live over the socket — carrying the hash of the safety number. They can jump
+straight to the comparison instead of hunting for you first.
+
+A request is a workflow convenience, **not** a security mechanism. Completion
+stays manual on both sides: a completed request marks nobody verified on its
+own. The security property still comes entirely from two humans comparing
+digits through a channel the server cannot observe. A request can help two
+people reach that comparison; it cannot stand in for it.
 
 Verified state is stored server-side so it follows the account across devices.
 The server learns only *that* a pair was verified plus a hash of the number,

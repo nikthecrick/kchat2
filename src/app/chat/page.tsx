@@ -29,6 +29,7 @@ import {
   hashString,
 } from '@/lib/crypto';
 import { VerifyDialog, type VerifyStatus } from '@/components/VerifyDialog';
+import { VerifyRequestsInbox } from '@/components/VerifyRequestsInbox';
 import { deriveSafetyNumberAsync } from '@/lib/safety-number';
 
 interface Peer {
@@ -78,6 +79,7 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const [verifyOpen, setVerifyOpen] = useState(false);
   const [verifyStatus, setVerifyStatus] = useState<VerifyStatus>('unverified');
+  const [verifyToken, setVerifyToken] = useState(0);
   const publicKeyRef = useRef<string | null>(null);
   const router = useRouter();
   const { theme, setTheme } = useTheme();
@@ -217,6 +219,17 @@ export default function ChatPage() {
       if (current && userId === current.peer.id) setPeerTyping(isTyping);
     });
 
+    // Poll for verification requests on connect. A dedicated event keeps this
+    // simple: the inbox itself fetches on mount, and this catches anything
+    // created while the user is already open.
+    socket.emit('verify-request:check');
+    socket.on('verify-request:check', () => socket.emit('verify-request:check'));
+
+    socket.on('verify-request:incoming', (data: { count: number }) => {
+      // Bump the token so the inbox refetches.
+      if (data?.count > 0) setVerifyToken((t) => t + 1);
+    });
+
     return () => {
       socket.close();
       socketRef.current = null;
@@ -291,6 +304,17 @@ export default function ChatPage() {
     <ErrorBoundary>
       <div className="flex h-screen bg-background">
         <div className="w-80 border-r flex flex-col">
+          <VerifyRequestsInbox
+            refreshToken={verifyToken}
+            onOpenVerify={(peerId) => {
+              const session = sessions.find((s) => s.peer.id === peerId);
+              if (session) {
+                activeRef.current = session;
+                setActive(session);
+                setVerifyOpen(true);
+              }
+            }}
+          />
           <div className="p-4 border-b">
             <div className="flex items-center justify-between mb-4">
               <div>
@@ -506,7 +530,12 @@ export default function ChatPage() {
           myPublicKey={publicKeyRef.current ?? ''}
           peerPublicKey={active.peer.publicKey}
           status={verifyStatus}
-          onStatusChange={setVerifyStatus}
+          onStatusChange={(next) => {
+            setVerifyStatus(next);
+            // Refresh the inbox so a completed request stops showing.
+            setVerifyToken((t) => t + 1);
+          }}
+          chatSessionId={active.id}
         />
       )}
     </ErrorBoundary>

@@ -33,6 +33,37 @@ model User {
   challenges       WebAuthnChallenge[]
   verificationsAsA VerifiedKeyPair[] @relation("VerifiedByA")
   verificationsAsB VerifiedKeyPair[] @relation("VerifiedByB")
+  sentVerifyRequests     VerificationRequest[] @relation("RequestSender")
+  receivedVerifyRequests VerificationRequest[] @relation("RequestReceiver")
+}
+
+// A request to verify a conversation.
+//
+// This is a workflow device, not a security device: it carries the safety
+// number to the other person and keeps the conversation open until both sides
+// have compared it. The security property still comes entirely from the two
+// humans comparing digits out of band.
+//
+// Because confirmation is always manual, a completed request carries no
+// authority on its own — it does not mark either side verified by itself.
+model VerificationRequest {
+  id         String   @id @default(cuid())
+  fromUserId String
+  toUserId   String
+  chatSessionId String?
+  // SHA-256 of the safety number for this key pair, so the receiving device can
+  // check it is being asked about the conversation it thinks it is.
+  numberHash String
+  // "pending" -> awaiting the other person -> "completed" -> both compared
+  status     String   @default("pending")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  fromUser User @relation("RequestSender", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUser   User @relation("RequestReceiver", fields: [toUserId], references: [id], onDelete: Cascade)
+
+  @@index([toUserId, status])
+  @@index([fromUserId, status])
 }
 
 // Records that two users have compared safety numbers for a conversation.

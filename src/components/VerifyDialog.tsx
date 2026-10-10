@@ -13,7 +13,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { ShieldCheck, ShieldAlert, RefreshCw } from 'lucide-react';
+import { ShieldCheck, ShieldAlert, RefreshCw, SendHorizonal } from 'lucide-react';
 import { hashString } from '@/lib/crypto';
 import {
   deriveSafetyNumberAsync,
@@ -34,6 +34,7 @@ interface VerifyDialogProps {
   peerPublicKey: string | null;
   status: VerifyStatus;
   onStatusChange: (status: VerifyStatus) => void;
+  chatSessionId?: string;
 }
 
 export function VerifyDialog({
@@ -45,12 +46,14 @@ export function VerifyDialog({
   peerPublicKey,
   status,
   onStatusChange,
+  chatSessionId,
 }: VerifyDialogProps) {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [number, setNumber] = useState<string | null>(null);
   const [entered, setEntered] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [requestSent, setRequestSent] = useState(false);
 
   const groups = number ? formatSafetyNumber(number) : [];
 
@@ -142,6 +145,30 @@ export function VerifyDialog({
       onOpenChange(false);
     } catch {
       setError('Network error while saving.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendRequest() {
+    if (!number) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const hash = await hashString(number);
+      const res = await fetch('/api/verify-request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peerId, numberHash: hash, chatSessionId }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error || 'Could not send the request.');
+        return;
+      }
+      setRequestSent(true);
+    } catch {
+      setError('Network error while sending.');
     } finally {
       setBusy(false);
     }
@@ -243,6 +270,21 @@ export function VerifyDialog({
             disabled={busy}
           />
         </div>
+
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={sendRequest}
+          disabled={busy || !number || requestSent}
+        >
+          <SendHorizonal className="mr-2 h-4 w-4" />
+          {requestSent ? 'Request sent' : `Ask ${peerName} to verify`}
+        </Button>
+        <p className="text-xs text-muted-foreground text-center -mt-2">
+          {requestSent
+            ? `They will see this request the next time they open KChat.`
+            : 'Sends them a reminder with this number. You still both need to compare it.'}
+        </p>
 
         {error && (
           <Alert variant="destructive">

@@ -13,6 +13,11 @@ import next from 'next';
 import { loadEnvConfig } from '@next/env';
 import { Server as SocketIOServer } from 'socket.io';
 import jwt from 'jsonwebtoken';
+import { PrismaClient } from '@prisma/client';
+
+// Assigned after loadEnvConfig() below — constructing PrismaClient at module
+// scope would happen before .env is read, leaving DATABASE_URL undefined.
+let prisma: PrismaClient;
 
 /**
  * Load .env before anything reads process.env.
@@ -24,6 +29,9 @@ import jwt from 'jsonwebtoken';
  * variables (Render, Docker) take precedence and are never overwritten.
  */
 loadEnvConfig(process.cwd());
+
+// Route handlers share this process, so a single client is enough.
+prisma = new PrismaClient();
 
 const dev = process.env.NODE_ENV !== 'production';
 // Always bind 0.0.0.0. Render sets HOSTNAME to the service name, so trusting
@@ -165,6 +173,29 @@ app.prepare().then(() => {
 
     socket.on('disconnect', () => {
       socket.leave(`user:${userId}`);
+    });
+
+    // Deliver any pending verification requests to a user who is already
+    // connected. The client emits this on connect and can re-emit to poll.
+    socket.on('verify-request:check', async () => {
+      try {
+        const pending = await prisma.verificationRequest.findMany({
+          where: { toUserId: userId, status: { not: 'completed' } },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        });
+        socket.emit('verify-request:incoming', {
+          count: pending.length,
+          requests: pending.map((r) => ({
+            id: r.id,
+            peerId: r.fromUserId,
+            status: r.status,
+            createdAt: r.createdAt,
+          })),
+        });
+      } catch (error) {
+        console.error('verify-request:check failed', error);
+      }
     });
   });
 
