@@ -83,7 +83,13 @@ model VerifiedKeyPair {
   // SHA-256 of the derived safety number, stored so a later key change can be
   // detected by recomputing and comparing.
   numberHash String
-  verifiedAt DateTime @default(now())
+  // Each side confirms independently, so the two flags are tracked separately.
+  // Both true is the only state that shows as fully verified.
+  verifiedA   Boolean  @default(false)
+  verifiedB   Boolean  @default(false)
+  verifiedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   userA User @relation("VerifiedByA", fields: [userAId], references: [id], onDelete: Cascade)
   userB User @relation("VerifiedByB", fields: [userBId], references: [id], onDelete: Cascade)
@@ -91,6 +97,24 @@ model VerifiedKeyPair {
   @@unique([userAId, userBId])
   @@index([userAId])
   @@index([userBId])
+}
+
+// A shareable link that delivers a safety number to the other person.
+//
+// Deliberately NOT an auto-verification mechanism: opening this page shows the
+// number and nothing more. Anyone holding the link can open it, including the
+// server, so a click must never mark a conversation verified. The number is
+// only ever displayed for a human to compare.
+model VerifyLink {
+  id         String   @id @default(cuid())
+  token      String   @unique
+  fromUserId String
+  peerId     String
+  numberHash String
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([expiresAt])
 }
 
 // Challenges are persisted server-side so the client can never choose the value

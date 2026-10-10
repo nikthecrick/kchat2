@@ -15,6 +15,8 @@ import {
   Lock,
   ShieldCheck,
   ShieldAlert,
+  ShieldQuestion,
+  ChevronLeft,
 } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
 import { useRouter } from 'next/navigation';
@@ -141,11 +143,11 @@ export default function ChatPage() {
       }
       const data = await res.json();
       setVerifyStatus(
-        data.status === 'verified'
-          ? 'verified'
-          : data.status === 'changed'
-            ? 'changed'
-            : 'unverified',
+        data.status === 'verified' ||
+          data.status === 'partial' ||
+          data.status === 'changed'
+          ? data.status
+          : 'unverified',
       );
     } catch {
       setVerifyStatus('unverified');
@@ -302,8 +304,15 @@ export default function ChatPage() {
 
   return (
     <ErrorBoundary>
-      <div className="flex h-screen bg-background">
-        <div className="w-80 border-r flex flex-col">
+      <div className='flex h-dvh overflow-hidden bg-background'>
+        {/* Sidebar: full width on mobile, fixed column from sm up. Hidden on
+            mobile once a conversation is open, otherwise it sits beside the
+            message list and squeezes both. */}
+        <div
+          className={`${
+            active ? 'hidden sm:flex' : 'flex'
+          } w-full sm:w-80 sm:shrink-0 border-r flex-col h-full`}
+        >
           <VerifyRequestsInbox
             refreshToken={verifyToken}
             onOpenVerify={(peerId) => {
@@ -412,21 +421,38 @@ export default function ChatPage() {
         </div>
 
         {active ? (
-          <div className="flex-1 flex flex-col">
-            <div className="p-4 border-b flex items-center gap-3">
-              <Avatar>
+          <div className="flex-1 flex flex-col min-w-0">
+            <div className="p-3 sm:p-4 border-b flex items-center gap-2 sm:gap-3">
+              {/* Back button, mobile only: the sidebar is hidden once a
+                  conversation is open, so this is the only way out. */}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="sm:hidden shrink-0 -ml-1"
+                onClick={() => {
+                  activeRef.current = null;
+                  setActive(null);
+                  setMessages([]);
+                }}
+              >
+                <ChevronLeft className="h-5 w-5" />
+                <span className="sr-only">Back to conversations</span>
+              </Button>
+              <Avatar className="shrink-0">
                 <AvatarFallback>
                   {active.peer.displayName[0]?.toUpperCase()}
                 </AvatarFallback>
               </Avatar>
-              <div>
-                <div className="font-medium">{active.peer.displayName}</div>
-                <div className="text-sm text-muted-foreground flex items-center gap-1">
+              <div className="min-w-0 flex-1">
+                <div className="font-medium truncate">
+                  {active.peer.displayName}
+                </div>
+                <div className="text-xs text-muted-foreground flex items-center gap-1 truncate">
                   {peerTyping ? (
                     'Typing…'
                   ) : (
                     <>
-                      <Lock className="h-3 w-3" />
+                      <Lock className="h-3 w-3 shrink-0" />
                       End-to-end encrypted
                     </>
                   )}
@@ -434,22 +460,27 @@ export default function ChatPage() {
               </div>
               <button
                 onClick={() => setVerifyOpen(true)}
-                className="ml-auto flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors hover:bg-accent"
+                className="shrink-0 flex items-center gap-1.5 rounded-full border px-2.5 sm:px-3 py-1 text-xs font-medium transition-colors hover:bg-accent"
               >
                 {verifyStatus === 'verified' ? (
                   <>
                     <ShieldCheck className="h-3.5 w-3.5 text-green-600" />
-                    <span className="text-green-700">Verified</span>
+                    <span className="hidden sm:inline text-green-700">Verified</span>
+                  </>
+                ) : verifyStatus === 'partial' ? (
+                  <>
+                    <ShieldQuestion className="h-3.5 w-3.5 text-amber-600" />
+                    <span className="hidden sm:inline text-amber-700">Half</span>
                   </>
                 ) : verifyStatus === 'changed' ? (
                   <>
                     <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
-                    <span className="text-amber-700">Key changed</span>
+                    <span className="hidden sm:inline text-amber-700">Key changed</span>
                   </>
                 ) : (
                   <>
                     <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
-                    <span className="text-amber-700">Not verified</span>
+                    <span className="hidden sm:inline text-amber-700">Not verified</span>
                   </>
                 )}
               </button>
@@ -482,7 +513,7 @@ export default function ChatPage() {
               </div>
             </ScrollArea>
 
-            <div className="p-4 border-t">
+            <div className="p-3 sm:p-4 border-t pb-[max(0.75rem,env(safe-area-inset-bottom))]">
               {error && (
                 <p className="mb-2 text-sm text-destructive">{error}</p>
               )}
@@ -504,7 +535,7 @@ export default function ChatPage() {
                     }
                   }}
                 />
-                <Button onClick={() => void send()} disabled={!draft.trim()}>
+                <Button onClick={() => void send()} disabled={!draft.trim()} className="shrink-0">
                   <Send className="h-4 w-4" />
                 </Button>
               </div>

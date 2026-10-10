@@ -10,16 +10,18 @@ function orderedPair(a: string, b: string): [string, string] {
   return [a, b].sort() as [string, string];
 }
 
+type Status = 'unverified' | 'partial' | 'verified' | 'changed';
+
 /**
- * GET /api/verify?peerId=…
+ * GET /api/verify?peerId=&numberHash=
  *
- * Reports whether the current user has verified the peer, and whether the
- * peer's public key still matches what was verified.
+ * Reports how far verification has progressed.
  *
- * The client sends the hash of the safety number it just computed. If that
- * differs from the stored hash, one of the keys changed since verification —
- * a legitimate reason would be the peer moving to a new device, and an illegitimate
- * one would be a server substituting a key. Either way the user should be told.
+ * Each side confirms independently, so there are four outcomes:
+ *   unverified — neither side has compared
+ *   partial    — exactly one side has compared ("50% verified")
+ *   verified   — both have compared the same number
+ *   changed    — a key changed since the comparison; verify again
  */
 export async function GET(request: NextRequest) {
   try {
@@ -47,13 +49,33 @@ export async function GET(request: NextRequest) {
     });
 
     if (!record) {
-      return NextResponse.json({ status: 'unverified' });
+      return NextResponse.json({ status: 'unverified', mineConfirmed: false, peerConfirmed: false });
     }
 
-    const keyChanged = record.numberHash !== currentHash;
+    const mineConfirmed = a === me.id ? record.verifiedA : record.verifiedB;
+    const peerConfirmed = a === me.id ? record.verifiedB : record.verifiedA;
+
+    // A key change outranks everything: the stored hash no longer describes
+    // this conversation, so prior confirmations no longer apply.
+    if (record.numberHash !== currentHash) {
+      return NextResponse.json({
+        status: 'changed',
+        mineConfirmed,
+        peerConfirmed,
+      });
+    }
+
+    const status: Status =
+      record.verifiedA && record.verifiedB
+        ? 'verified'
+        : record.verifiedA || record.verifiedB
+          ? 'partial'
+          : 'unverified';
 
     return NextResponse.json({
-      status: keyChanged ? 'changed' : 'verified',
+      status,
+      mineConfirmed,
+      peerConfirmed,
       verifiedAt: record.verifiedAt,
     });
   } catch (error) {
@@ -65,11 +87,10 @@ export async function GET(request: NextRequest) {
 /**
  * POST /api/verify
  *
- * Records that the user compared the safety number for a conversation.
+ * Records that THIS user compared the safety number.
  *
- * The server is told a hash, never the number, and cannot influence how the
- * number is derived. It also does not mark the *peer* as verified: each side
- * confirms independently, since one of the two may never open the app.
+ * Only the caller's own flag is set. One person confirming never verifies the
+ * conversation on its own — the other side has to do the same comparison.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -94,8 +115,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Cannot verify yourself' }, { status: 400 });
     }
 
-    // The peer must actually exist and have a public key, otherwise this is a
-    // row pointing at nothing.
     const peer = await db.user.findUnique({
       where: { id: peerId },
       select: { id: true, e2ePublicKey: true },
@@ -105,15 +124,60 @@ export async function POST(request: NextRequest) {
     }
 
     const [a, b] = orderedPair(me.id, peerId);
-    const record = await db.verifiedKeyPair.upsert({
+    const iAmA = a === me.id;
+
+    const existing = await db.verifiedKeyPair.findUnique({
       where: { userAId_userBId: { userAId: a, userBId: b } },
-      create: { userAId: a, userBId: b, numberHash },
-      update: { numberHash, verifiedAt: new Date() },
     });
 
+    // Detect a key change: the stored hash no longer matches what we just
+    // computed, so start a fresh confirmation rather than keeping stale flags.
+    const keyChanged = existing && existing.numberHash !== numberHash;
+
+    const myFlag = iAmA ? 'verifiedA' : 'verifiedB';
+    const theirFlag = iAmA ? 'verifiedB' : 'verifiedA';
+
+    const data = keyChanged
+      ? {
+          numberHash,
+          [myFlag]: true,
+          [theirFlag]: false,
+          verifiedAt: null,
+          updatedAt: new Date(),
+        }
+      : {
+          [myFlag]: true,
+          updatedAt: new Date(),
+        };
+
+    const record = await db.verifiedKeyPair.upsert({
+      where: { userAId_userBId: { userAId: a, userBId: b } },
+      create: {
+        userAId: a,
+        userBId: b,
+        numberHash,
+        [myFlag]: true,
+      },
+      update: data,
+    });
+
+    const fullyVerified = record.verifiedA && record.verifiedB;
+    if (fullyVerified && !record.verifiedAt) {
+      await db.verifiedKeyPair.update({
+        where: { id: record.id },
+        data: { verifiedAt: new Date() },
+      });
+    }
+
     return NextResponse.json({
-      status: 'verified',
-      verifiedAt: record.verifiedAt,
+      status: fullyVerified
+        ? 'verified'
+        : record[myFlag] && record[theirFlag]
+          ? 'verified'
+          : 'partial',
+      mineConfirmed: true,
+      peerConfirmed: fullyVerified,
+      keyChanged,
     });
   } catch (error) {
     console.error('verify:mark failed', error);
@@ -121,7 +185,7 @@ export async function POST(request: NextRequest) {
   }
 }
 
-/** DELETE /api/verify?peerId=… — revoke a verification. */
+/** DELETE /api/verify?peerId=… — revoke this side's confirmation. */
 export async function DELETE(request: NextRequest) {
   try {
     const me = await getSessionUser();
@@ -135,11 +199,17 @@ export async function DELETE(request: NextRequest) {
     }
 
     const [a, b] = orderedPair(me.id, peerId);
+    const iAmA = a === me.id;
+
+    // Revoke only my own side: the other person's confirmation stays valid.
     await db.verifiedKeyPair
-      .delete({ where: { userAId_userBId: { userAId: a, userBId: b } } })
+      .update({
+        where: { userAId_userBId: { userAId: a, userBId: b } },
+        data: { [iAmA ? 'verifiedA' : 'verifiedB']: false, verifiedAt: null },
+      })
       .catch(() => {});
 
-    return NextResponse.json({ status: 'unverified' });
+    return NextResponse.json({ status: 'unverified', mineConfirmed: false });
   } catch (error) {
     console.error('verify:revoke failed', error);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
